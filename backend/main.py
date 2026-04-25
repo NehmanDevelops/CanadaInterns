@@ -80,7 +80,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Canada Interns API",
     description="Backend for the Canada Interns internship discovery platform.",
-    version="0.1.0",
+    version="0.2.0",
     lifespan=lifespan,
 )
 
@@ -103,20 +103,26 @@ async def root():
 
 @app.get("/api/jobs")
 async def get_jobs(
-    location: Optional[str] = Query(None, description="Filter by location (case-insensitive substring match)"),
-    field: Optional[str] = Query(None, description="Filter by title keyword / field"),
+    location: Optional[str] = Query(None, description="Filter by location substring"),
+    field: Optional[str] = Query(None, description="Filter by title keyword"),
+    country: Optional[str] = Query(None, description="Filter by country (e.g. Canada)"),
+    active_only: bool = Query(True, description="Only show active listings"),
     limit: int = Query(100, ge=1, le=500),
     offset: int = Query(0, ge=0),
 ):
     """
-    Return jobs with optional location and field (title keyword) filters.
-    Results are ordered by first_seen descending (newest discoveries first).
+    Return jobs with optional filters.
+    Results ordered by first_seen descending (newest discoveries first).
     """
     url = f"{SUPABASE_REST}/jobs?select=*&order=first_seen.desc&offset={offset}&limit={limit}"
     if location:
         url += f"&location=ilike.*{location}*"
     if field:
         url += f"&title=ilike.*{field}*"
+    if country:
+        url += f"&country=eq.{country}"
+    if active_only:
+        url += "&is_active=eq.true"
 
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url, headers=SB_HEADERS)
@@ -125,9 +131,14 @@ async def get_jobs(
 
 
 @app.get("/api/jobs/latest")
-async def get_latest_jobs():
+async def get_latest_jobs(
+    country: Optional[str] = Query(None, description="Filter by country"),
+):
     """Return the 25 most recently discovered jobs."""
-    url = f"{SUPABASE_REST}/jobs?select=*&order=first_seen.desc&limit=25"
+    url = f"{SUPABASE_REST}/jobs?select=*&order=first_seen.desc&limit=25&is_active=eq.true"
+    if country:
+        url += f"&country=eq.{country}"
+
     async with httpx.AsyncClient(timeout=10) as client:
         resp = await client.get(url, headers=SB_HEADERS)
         data = resp.json() if resp.status_code == 200 else []
@@ -140,10 +151,30 @@ async def get_stats():
     headers = {**SB_HEADERS, "Prefer": "count=exact"}
     async with httpx.AsyncClient(timeout=10) as client:
         total = await client.head(f"{SUPABASE_REST}/jobs?select=id", headers=headers)
-        gh = await client.head(f"{SUPABASE_REST}/jobs?select=id&ats_platform=eq.greenhouse", headers=headers)
-        lv = await client.head(f"{SUPABASE_REST}/jobs?select=id&ats_platform=eq.lever", headers=headers)
+        active = await client.head(f"{SUPABASE_REST}/jobs?select=id&is_active=eq.true", headers=headers)
+        canada = await client.head(f"{SUPABASE_REST}/jobs?select=id&country=eq.Canada&is_active=eq.true", headers=headers)
+        gh = await client.head(f"{SUPABASE_REST}/jobs?select=id&ats_platform=eq.greenhouse&is_active=eq.true", headers=headers)
+        lv = await client.head(f"{SUPABASE_REST}/jobs?select=id&ats_platform=eq.lever&is_active=eq.true", headers=headers)
+
+    def _count(resp):
+        return int(resp.headers.get("content-range", "*/0").split("/")[-1])
+
     return {
-        "total_jobs": int(total.headers.get("content-range", "*/0").split("/")[-1]),
-        "greenhouse_jobs": int(gh.headers.get("content-range", "*/0").split("/")[-1]),
-        "lever_jobs": int(lv.headers.get("content-range", "*/0").split("/")[-1]),
+        "total_jobs": _count(total),
+        "active_jobs": _count(active),
+        "canadian_jobs": _count(canada),
+        "greenhouse_jobs": _count(gh),
+        "lever_jobs": _count(lv),
     }
+
+
+@app.get("/api/jobs/countries")
+async def get_countries():
+    """Return distinct countries for filter dropdowns."""
+    url = f"{SUPABASE_REST}/jobs?select=country&is_active=eq.true&order=country"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url, headers=SB_HEADERS)
+        data = resp.json() if resp.status_code == 200 else []
+    # Deduplicate
+    countries = sorted(set(item["country"] for item in data if item.get("country")))
+    return {"countries": countries}
