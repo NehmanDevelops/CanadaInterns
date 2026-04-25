@@ -15,7 +15,6 @@ from typing import Optional
 
 import httpx
 from dotenv import load_dotenv
-from supabase import create_client, Client
 
 load_dotenv()
 
@@ -23,11 +22,17 @@ logger = logging.getLogger("crawler")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(name)s  %(levelname)s  %(message)s")
 
 # ---------------------------------------------------------------------------
-# Supabase client
+# Supabase REST API config (using httpx directly for reliability)
 # ---------------------------------------------------------------------------
 SUPABASE_URL: str = os.environ["SUPABASE_URL"]
 SUPABASE_KEY: str = os.environ["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_REST_URL: str = f"{SUPABASE_URL}/rest/v1"
+SUPABASE_HEADERS: dict = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+    "Content-Type": "application/json",
+    "Prefer": "resolution=merge-duplicates,return=representation",
+}
 
 # ---------------------------------------------------------------------------
 # Company boards to crawl
@@ -189,11 +194,11 @@ async def crawl_lever(client: httpx.AsyncClient) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Upsert logic
+# Upsert logic (direct Supabase REST API via httpx)
 # ---------------------------------------------------------------------------
-def _upsert_jobs(jobs: list[dict]) -> int:
+async def _upsert_jobs(jobs: list[dict]) -> int:
     """
-    Upsert jobs into Supabase.
+    Upsert jobs into Supabase via the PostgREST API.
     Uses the deterministic `id` as the conflict target so duplicates are
     updated rather than inserted again.  `first_seen` is only set on the
     first insert (default now()).
@@ -202,21 +207,20 @@ def _upsert_jobs(jobs: list[dict]) -> int:
         return 0
 
     inserted = 0
-    # Batch in chunks of 50 to stay within Supabase limits
-    for i in range(0, len(jobs), 50):
-        batch = jobs[i : i + 50]
-        # On conflict, update everything EXCEPT first_seen so the original
-        # discovery timestamp is preserved.
-        result = (
-            supabase.table("jobs")
-            .upsert(
-                batch,
-                on_conflict="id",
-                ignore_duplicates=False,
+    async with httpx.AsyncClient(timeout=15) as client:
+        # Batch in chunks of 50 to stay within Supabase limits
+        for i in range(0, len(jobs), 50):
+            batch = jobs[i : i + 50]
+            resp = await client.post(
+                f"{SUPABASE_REST_URL}/jobs",
+                headers=SUPABASE_HEADERS,
+                json=batch,
             )
-            .execute()
-        )
-        inserted += len(result.data) if result.data else 0
+            if resp.status_code in (200, 201):
+                data = resp.json()
+                inserted += len(data) if isinstance(data, list) else 1
+            else:
+                logger.error(f"Supabase upsert failed: {resp.status_code} {resp.text}")
     return inserted
 
 
@@ -236,7 +240,7 @@ async def run_crawler() -> dict:
         )
 
     all_jobs = greenhouse_jobs + lever_jobs
-    count = _upsert_jobs(all_jobs)
+    count = await _upsert_jobs(all_jobs)
     logger.info(f"Crawl cycle done — {len(all_jobs)} jobs found, {count} upserted")
     return {
         "greenhouse": len(greenhouse_jobs),

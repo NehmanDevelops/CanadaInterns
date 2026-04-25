@@ -1,10 +1,19 @@
 'use client';
 
 import React from 'react';
-import { Internship } from './InternshipBoard';
+
+interface CardJob {
+  id: string;
+  title: string;
+  company: string;
+  location: string;
+  url: string;
+  ats_platform: string;
+  postedAt: string;
+}
 
 interface InternshipCardProps {
-  job: Internship;
+  job: CardJob;
   isTracked: boolean;
   onTrack: () => void;
   onApply: () => void;
@@ -12,7 +21,9 @@ interface InternshipCardProps {
 }
 
 export default function InternshipCard({ job, isTracked, onTrack, onApply, index }: InternshipCardProps) {
-  const { title, company, location, description, postedAt, field } = job;
+  const { title, company, location, url, ats_platform, postedAt } = job;
+
+  const platformLabel = ats_platform === 'greenhouse' ? 'Greenhouse' : ats_platform === 'lever' ? 'Lever' : ats_platform;
 
   return (
     <article
@@ -21,21 +32,29 @@ export default function InternshipCard({ job, isTracked, onTrack, onApply, index
       id={`listing-${index}`}
     >
       <div className="p-5">
-        {/* Top row: field tag + timestamp */}
+        {/* Top row: platform tag + timestamp */}
         <div className="flex items-start justify-between mb-3">
           <span className="inline-block px-2 py-0.5 text-2xs font-semibold uppercase tracking-wider text-teal bg-teal-light rounded">
-            {field}
+            {platformLabel}
           </span>
           <time className="text-2xs text-slate-400 whitespace-nowrap ml-3">{postedAt}</time>
         </div>
 
-        {/* Title */}
-        <h3 className="text-base font-semibold text-slate-900 leading-snug mb-1 group-hover:text-maple transition-colors">
+        {/* Title — links to the actual job posting */}
+        <a
+          href={url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="block text-base font-semibold text-slate-900 leading-snug mb-1 group-hover:text-maple transition-colors hover:underline"
+        >
           {title}
-        </h3>
+          <svg className="inline-block w-3 h-3 ml-1 text-slate-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+          </svg>
+        </a>
 
         {/* Company + Location */}
-        <div className="flex items-center gap-2 text-sm text-slate-500 mb-3">
+        <div className="flex items-center gap-2 text-sm text-slate-500 mb-4">
           <span className="font-medium text-slate-600">{company}</span>
           <span className="text-slate-300">·</span>
           <span className="inline-flex items-center gap-1">
@@ -46,11 +65,6 @@ export default function InternshipCard({ job, isTracked, onTrack, onApply, index
             {location}
           </span>
         </div>
-
-        {/* Description snippet */}
-        <p className="text-sm text-slate-500 leading-relaxed line-clamp-2 mb-4">
-          {description}
-        </p>
 
         {/* Actions */}
         <div className="flex items-center gap-2 pt-3 border-t border-slate-100">
@@ -64,6 +78,18 @@ export default function InternshipCard({ job, isTracked, onTrack, onApply, index
             </svg>
             Apply
           </button>
+
+          <a
+            href={url}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="inline-flex items-center gap-1.5 px-3 py-2 text-sm font-medium text-slate-600 bg-slate-100 hover:bg-slate-200 rounded-md transition-all"
+          >
+            <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+            </svg>
+            View
+          </a>
 
           <button
             onClick={onTrack}

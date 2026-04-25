@@ -15,7 +15,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from supabase import create_client, Client
+import httpx
 
 from crawler import run_crawler
 
@@ -25,11 +25,15 @@ logger = logging.getLogger("server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(name)s  %(levelname)s  %(message)s")
 
 # ---------------------------------------------------------------------------
-# Supabase client (reused across requests)
+# Supabase REST API config
 # ---------------------------------------------------------------------------
 SUPABASE_URL: str = os.environ["SUPABASE_URL"]
 SUPABASE_KEY: str = os.environ["SUPABASE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+SUPABASE_REST: str = f"{SUPABASE_URL}/rest/v1"
+SB_HEADERS: dict = {
+    "apikey": SUPABASE_KEY,
+    "Authorization": f"Bearer {SUPABASE_KEY}",
+}
 
 # ---------------------------------------------------------------------------
 # Scheduler
@@ -108,49 +112,38 @@ async def get_jobs(
     Return jobs with optional location and field (title keyword) filters.
     Results are ordered by first_seen descending (newest discoveries first).
     """
-    query = supabase.table("jobs").select("*").order("first_seen", desc=True)
-
+    url = f"{SUPABASE_REST}/jobs?select=*&order=first_seen.desc&offset={offset}&limit={limit}"
     if location:
-        query = query.ilike("location", f"%{location}%")
+        url += f"&location=ilike.*{location}*"
     if field:
-        query = query.ilike("title", f"%{field}%")
+        url += f"&title=ilike.*{field}*"
 
-    query = query.range(offset, offset + limit - 1)
-    result = query.execute()
-    return {"jobs": result.data, "count": len(result.data)}
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url, headers=SB_HEADERS)
+        data = resp.json() if resp.status_code == 200 else []
+    return {"jobs": data, "count": len(data)}
 
 
 @app.get("/api/jobs/latest")
 async def get_latest_jobs():
     """Return the 25 most recently discovered jobs."""
-    result = (
-        supabase.table("jobs")
-        .select("*")
-        .order("first_seen", desc=True)
-        .limit(25)
-        .execute()
-    )
-    return {"jobs": result.data, "count": len(result.data)}
+    url = f"{SUPABASE_REST}/jobs?select=*&order=first_seen.desc&limit=25"
+    async with httpx.AsyncClient(timeout=10) as client:
+        resp = await client.get(url, headers=SB_HEADERS)
+        data = resp.json() if resp.status_code == 200 else []
+    return {"jobs": data, "count": len(data)}
 
 
 @app.get("/api/jobs/stats")
 async def get_stats():
     """Quick stats for the dashboard."""
-    total = supabase.table("jobs").select("id", count="exact").execute()
-    greenhouse = (
-        supabase.table("jobs")
-        .select("id", count="exact")
-        .eq("ats_platform", "greenhouse")
-        .execute()
-    )
-    lever = (
-        supabase.table("jobs")
-        .select("id", count="exact")
-        .eq("ats_platform", "lever")
-        .execute()
-    )
+    headers = {**SB_HEADERS, "Prefer": "count=exact"}
+    async with httpx.AsyncClient(timeout=10) as client:
+        total = await client.head(f"{SUPABASE_REST}/jobs?select=id", headers=headers)
+        gh = await client.head(f"{SUPABASE_REST}/jobs?select=id&ats_platform=eq.greenhouse", headers=headers)
+        lv = await client.head(f"{SUPABASE_REST}/jobs?select=id&ats_platform=eq.lever", headers=headers)
     return {
-        "total_jobs": total.count,
-        "greenhouse_jobs": greenhouse.count,
-        "lever_jobs": lever.count,
+        "total_jobs": int(total.headers.get("content-range", "*/0").split("/")[-1]),
+        "greenhouse_jobs": int(gh.headers.get("content-range", "*/0").split("/")[-1]),
+        "lever_jobs": int(lv.headers.get("content-range", "*/0").split("/")[-1]),
     }

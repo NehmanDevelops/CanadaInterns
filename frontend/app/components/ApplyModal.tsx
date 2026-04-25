@@ -29,7 +29,7 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
   const handleTailor = () => {
     if (!file) return;
     setStatus('processing');
-    // Simulate AI processing
+    // Simulate AI processing — will connect to real endpoint later
     setTimeout(() => setStatus('done'), 2500);
   };
 
@@ -64,6 +64,35 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
         <div className="px-6 py-5">
           {status === 'idle' && (
             <>
+              {/* Direct link to job posting */}
+              <a
+                href={job.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="flex items-center gap-3 p-3 mb-4 bg-maple-50 border border-maple/20 rounded-lg hover:bg-maple-light transition-colors group"
+                id="apply-external-link"
+              >
+                <div className="w-9 h-9 rounded-md bg-maple flex items-center justify-center flex-shrink-0">
+                  <svg className="w-4 h-4 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                  </svg>
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-maple group-hover:underline">Apply directly on {job.company}</p>
+                  <p className="text-xs text-slate-500 truncate">{job.url}</p>
+                </div>
+                <svg className="w-4 h-4 text-slate-400 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                </svg>
+              </a>
+
+              {/* Divider */}
+              <div className="flex items-center gap-3 mb-4">
+                <hr className="flex-1 border-slate-200" />
+                <span className="text-xs text-slate-400 uppercase tracking-wider">or tailor your resume first</span>
+                <hr className="flex-1 border-slate-200" />
+              </div>
+
               {/* Drop zone */}
               <div
                 className={`border-2 border-dashed rounded-lg p-8 text-center transition-colors ${
@@ -103,12 +132,6 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
                 )}
               </div>
 
-              {/* Job description preview */}
-              <div className="mt-4 p-3 bg-slate-50 rounded-md border border-slate-200">
-                <p className="text-xs font-semibold uppercase tracking-wider text-slate-400 mb-1">Job description</p>
-                <p className="text-sm text-slate-600 line-clamp-3">{job.description}</p>
-              </div>
-
               {/* Info note */}
               <div className="mt-4 flex items-start gap-2 text-xs text-slate-500">
                 <svg className="w-4 h-4 text-slate-400 flex-shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
@@ -123,7 +146,6 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
 
           {status === 'processing' && (
             <div className="py-12 flex flex-col items-center gap-4 animate-fade-in">
-              {/* Spinner */}
               <div className="w-10 h-10 border-3 border-slate-200 border-t-maple rounded-full animate-spin" style={{ borderWidth: '3px' }} />
               <div className="text-center">
                 <p className="text-sm font-medium text-slate-700">Tailoring your resume…</p>
@@ -153,15 +175,28 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
                 <p className="text-teal">+ Conducted quantitative data analysis using Python and SQL, delivering actionable insights to stakeholders</p>
               </div>
 
-              <button
-                className="mt-2 inline-flex items-center gap-2 px-5 py-2.5 bg-maple text-white text-sm font-semibold rounded-md hover:bg-maple-dark transition-colors shadow-sm"
-                id="download-resume-btn"
-              >
-                <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                </svg>
-                Download tailored resume
-              </button>
+              <div className="flex gap-3 mt-2">
+                <button
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-maple text-white text-sm font-semibold rounded-md hover:bg-maple-dark transition-colors shadow-sm"
+                  id="download-resume-btn"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                  </svg>
+                  Download resume
+                </button>
+                <a
+                  href={job.url}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-2 px-5 py-2.5 bg-slate-100 text-slate-700 text-sm font-semibold rounded-md hover:bg-slate-200 transition-colors"
+                >
+                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                    <path strokeLinecap="round" strokeLinejoin="round" d="M10 6H6a2 2 0 00-2 2v10a2 2 0 002 2h10a2 2 0 002-2v-4M14 4h6m0 0v6m0-6L10 14" />
+                  </svg>
+                  Go to posting
+                </a>
+              </div>
             </div>
           )}
         </div>

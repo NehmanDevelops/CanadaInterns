@@ -1,56 +1,94 @@
 'use client';
 
-import { useState, useMemo } from 'react';
+import { useState, useEffect, useMemo, useCallback } from 'react';
 import FilterBar from './FilterBar';
 import InternshipCard from './InternshipCard';
 import ApplyModal from './ApplyModal';
 
 export interface Internship {
-  id: number;
+  id: string;
   title: string;
   company: string;
   location: string;
-  description: string;
-  postedAt: string;
-  daysAgo: number;
-  field: string;
+  url: string;
+  ats_platform: string;
+  posted_at: string;
+  first_seen: string;
+  is_canadian: boolean;
 }
 
-const SEED_DATA: Internship[] = [
-  { id: 1, title: 'Software Developer Intern', company: 'MapleTech', location: 'Toronto, ON', description: 'Work on real-world web apps with a Canadian tech leader. Collaborate with senior engineers on microservices architecture, CI/CD pipelines, and cloud deployments.', postedAt: '2 days ago', daysAgo: 2, field: 'Software & Engineering' },
-  { id: 2, title: 'Marketing Intern', company: 'True North Media', location: 'Vancouver, BC', description: 'Assist in digital campaigns for Canadian brands. Create content strategies, manage social channels, and analyze campaign performance metrics.', postedAt: '1 day ago', daysAgo: 1, field: 'Marketing & Media' },
-  { id: 3, title: 'Data Analyst Intern', company: 'Prairie Analytics', location: 'Calgary, AB', description: 'Analyze data trends for Canadian agriculture. Build dashboards, run statistical analyses, and present insights to stakeholders.', postedAt: '3 days ago', daysAgo: 3, field: 'Data & Analytics' },
-  { id: 4, title: 'Finance Intern', company: 'Bank of Canada', location: 'Ottawa, ON', description: 'Support financial modeling and reporting. Assist with quarterly forecasts, regulatory compliance documentation, and risk assessment frameworks.', postedAt: 'about 5 hours ago', daysAgo: 0, field: 'Finance' },
-  { id: 5, title: 'UX/UI Design Intern', company: 'RedLeaf Studios', location: 'Montreal, QC', description: 'Design user interfaces for Canadian startups. Conduct user research, build wireframes and prototypes, and collaborate with developers on implementation.', postedAt: 'about 6 hours ago', daysAgo: 0, field: 'Design' },
-  { id: 6, title: 'Engineering Intern', company: 'Northern Rail', location: 'Winnipeg, MB', description: 'Work on infrastructure projects across Canada. Participate in structural analysis, project planning, and site inspections for national rail expansion.', postedAt: '4 days ago', daysAgo: 4, field: 'Software & Engineering' },
-  { id: 7, title: 'Policy Research Intern', company: 'Gov of Canada', location: 'Ottawa, ON', description: 'Research and draft policy briefs. Analyze legislative proposals, compile evidence-based recommendations, and support parliamentary committee work.', postedAt: '1 day ago', daysAgo: 1, field: 'Policy & Government' },
-  { id: 8, title: 'Environmental Science Intern', company: 'EcoCan', location: 'Victoria, BC', description: 'Assist with field research and reporting. Collect environmental samples, analyze water quality data, and contribute to conservation impact reports.', postedAt: '2 days ago', daysAgo: 2, field: 'Science & Environment' },
-  { id: 9, title: 'Product Management Intern', company: 'StartupHub', location: 'Toronto, ON', description: 'Coordinate product launches and feedback. Manage feature backlogs, run sprint planning sessions, and gather user feedback for iteration.', postedAt: 'about 3 hours ago', daysAgo: 0, field: 'Product Management' },
-  { id: 10, title: 'Journalism Intern', company: 'The Canadian Press', location: 'Toronto, ON', description: 'Write and edit news stories for national syndication. Cover breaking news, conduct interviews, and fact-check articles for publication.', postedAt: 'about 7 hours ago', daysAgo: 0, field: 'Journalism' },
-];
+const API_BASE = process.env.NEXT_PUBLIC_API_BASE_URL || 'http://localhost:8000';
 
 interface InternshipBoardProps {
-  trackedIds: Set<number>;
-  onToggleTrack: (id: number) => void;
+  trackedIds: Set<string>;
+  onToggleTrack: (id: string, job?: Internship) => void;
 }
 
 export default function InternshipBoard({ trackedIds, onToggleTrack }: InternshipBoardProps) {
+  const [jobs, setJobs] = useState<Internship[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
   const [location, setLocation] = useState('All Locations');
   const [field, setField] = useState('All Fields');
   const [datePosted, setDatePosted] = useState('');
   const [applyJob, setApplyJob] = useState<Internship | null>(null);
 
+  // Fetch jobs from backend
+  const fetchJobs = useCallback(async () => {
+    try {
+      setLoading(true);
+      const params = new URLSearchParams();
+      if (location !== 'All Locations') params.set('location', location.split(',')[0].trim());
+      if (field !== 'All Fields') params.set('field', field);
+      params.set('limit', '200');
+
+      const res = await fetch(`${API_BASE}/api/jobs?${params.toString()}`);
+      if (!res.ok) throw new Error(`API error: ${res.status}`);
+      const data = await res.json();
+      setJobs(data.jobs || []);
+      setError(null);
+    } catch (err: any) {
+      console.error('Failed to fetch jobs:', err);
+      setError('Could not load listings. Make sure the backend is running.');
+      setJobs([]);
+    } finally {
+      setLoading(false);
+    }
+  }, [location, field]);
+
+  // Initial fetch + refetch when filters change
+  useEffect(() => {
+    fetchJobs();
+  }, [fetchJobs]);
+
+  // Auto-refresh every 5 minutes
+  useEffect(() => {
+    const interval = setInterval(fetchJobs, 5 * 60 * 1000);
+    return () => clearInterval(interval);
+  }, [fetchJobs]);
+
+  // Client-side date filter
   const filtered = useMemo(() => {
-    return SEED_DATA.filter((job) => {
-      if (location !== 'All Locations' && job.location !== location) return false;
-      if (field !== 'All Fields' && job.field !== field) return false;
-      if (datePosted) {
-        const days = parseInt(datePosted, 10);
-        if (job.daysAgo > days) return false;
-      }
-      return true;
+    if (!datePosted) return jobs;
+    const days = parseInt(datePosted, 10);
+    const cutoff = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+    return jobs.filter((job) => {
+      const seen = new Date(job.first_seen || job.posted_at);
+      return seen >= cutoff;
     });
-  }, [location, field, datePosted]);
+  }, [jobs, datePosted]);
+
+  // Relative time helper
+  function timeAgo(dateStr: string): string {
+    if (!dateStr) return '';
+    const diff = Date.now() - new Date(dateStr).getTime();
+    const mins = Math.floor(diff / 60000);
+    if (mins < 60) return `about ${mins} min ago`;
+    const hours = Math.floor(mins / 60);
+    if (hours < 24) return `about ${hours} hour${hours > 1 ? 's' : ''} ago`;
+    const days = Math.floor(hours / 24);
+    return `${days} day${days > 1 ? 's' : ''} ago`;
+  }
 
   return (
     <>
@@ -69,12 +107,30 @@ export default function InternshipBoard({ trackedIds, onToggleTrack }: Internshi
         <div className="flex items-center gap-3 mb-6">
           <hr className="newspaper-divider-thick flex-1" />
           <h2 className="text-xs font-semibold uppercase tracking-widest text-slate-400 whitespace-nowrap">
-            Latest Listings
+            {loading ? 'Loading…' : 'Live Listings'}
           </h2>
           <hr className="newspaper-divider-thick flex-1" />
         </div>
 
-        {filtered.length === 0 ? (
+        {/* Error state */}
+        {error && (
+          <div className="text-center py-12 animate-fade-in">
+            <p className="text-sm text-maple font-medium mb-2">{error}</p>
+            <button onClick={fetchJobs} className="text-sm text-slate-500 hover:text-slate-700 underline">
+              Retry
+            </button>
+          </div>
+        )}
+
+        {/* Loading state */}
+        {loading && !error && (
+          <div className="flex justify-center py-16">
+            <div className="w-8 h-8 border-2 border-slate-200 border-t-maple rounded-full animate-spin" />
+          </div>
+        )}
+
+        {/* Empty state */}
+        {!loading && !error && filtered.length === 0 && (
           <div className="text-center py-16 animate-fade-in">
             <p className="text-slate-400 text-sm">No internships match your filters.</p>
             <button
@@ -84,14 +140,17 @@ export default function InternshipBoard({ trackedIds, onToggleTrack }: Internshi
               Clear all filters
             </button>
           </div>
-        ) : (
+        )}
+
+        {/* Job grid */}
+        {!loading && !error && filtered.length > 0 && (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 stagger-children">
             {filtered.map((job, idx) => (
               <InternshipCard
                 key={job.id}
-                job={job}
+                job={{ ...job, postedAt: timeAgo(job.posted_at || job.first_seen) }}
                 isTracked={trackedIds.has(job.id)}
-                onTrack={() => onToggleTrack(job.id)}
+                onTrack={() => onToggleTrack(job.id, job)}
                 onApply={() => setApplyJob(job)}
                 index={idx}
               />
