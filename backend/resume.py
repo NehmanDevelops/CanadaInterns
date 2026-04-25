@@ -27,53 +27,42 @@ logger = logging.getLogger("resume")
 router = APIRouter(prefix="/api/resume", tags=["resume"])
 
 # ---------------------------------------------------------------------------
-# Gemini API config (free tier)
+# Groq API config (free tier — no billing required)
+# Uses Llama 3.3 70B via Groq's OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
-GEMINI_API_KEY: str = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_URL: str = (
-    "https://generativelanguage.googleapis.com/v1beta/models/"
-    "gemini-2.0-flash:generateContent"
-)
+GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
+GROQ_URL: str = "https://api.groq.com/openai/v1/chat/completions"
 
 
-async def _call_gemini(system_prompt: str, user_prompt: str) -> str:
-    """Call Google Gemini 2.0 Flash via REST API and return the text response."""
-    if not GEMINI_API_KEY:
-        raise ValueError("GEMINI_API_KEY not set in environment")
+async def _call_llm(system_prompt: str, user_prompt: str) -> str:
+    """Call Groq (Llama 3.3 70B) via their OpenAI-compatible REST API."""
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY not set in environment")
 
     payload = {
-        "system_instruction": {
-            "parts": [{"text": system_prompt}]
-        },
-        "contents": [
-            {
-                "role": "user",
-                "parts": [{"text": user_prompt}],
-            }
+        "model": "llama-3.3-70b-versatile",
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
         ],
-        "generationConfig": {
-            "temperature": 0.3,
-            "maxOutputTokens": 2000,
-            "responseMimeType": "application/json",
-        },
+        "temperature": 0.3,
+        "max_tokens": 2000,
+        "response_format": {"type": "json_object"},
     }
 
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
-            f"{GEMINI_URL}?key={GEMINI_API_KEY}",
+            GROQ_URL,
+            headers={
+                "Authorization": f"Bearer {GROQ_API_KEY}",
+                "Content-Type": "application/json",
+            },
             json=payload,
         )
         resp.raise_for_status()
         data = resp.json()
 
-    # Extract text from Gemini response
-    candidates = data.get("candidates", [])
-    if not candidates:
-        raise ValueError("Gemini returned no candidates")
-    parts = candidates[0].get("content", {}).get("parts", [])
-    if not parts:
-        raise ValueError("Gemini returned no content")
-    return parts[0].get("text", "")
+    return data["choices"][0]["message"]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -185,9 +174,9 @@ async def analyze_resume(
     # 3. Calculate ATS score BEFORE
     ats_before, matched_before, missing_before = _calculate_ats_score(resume_text, keywords)
 
-    # 4. Send to Gemini 2.0 Flash (free)
+    # 4. Send to Groq (Llama 3.3 70B — free)
     try:
-        raw = await _call_gemini(
+        raw = await _call_llm(
             SYSTEM_PROMPT,
             f"RESUME:\n{resume_text}\n\n---\n\nJOB DESCRIPTION:\n{job_description}",
         )
@@ -200,10 +189,10 @@ async def analyze_resume(
 
         changes = json.loads(cleaned)
     except json.JSONDecodeError:
-        logger.error(f"Gemini returned invalid JSON: {raw[:500]}")
+        logger.error(f"Groq returned invalid JSON: {raw[:500]}")
         changes = []
     except Exception as exc:
-        logger.error(f"Gemini API error: {exc}")
+        logger.error(f"Groq API error: {exc}")
         return {"error": f"AI processing failed: {str(exc)}"}
 
     # 5. Calculate ATS score AFTER (simulate applying changes)
