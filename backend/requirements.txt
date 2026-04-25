@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+python-docx
+PyMuPDF
+openai
+supabase-py
+requests
+python-dotenv
