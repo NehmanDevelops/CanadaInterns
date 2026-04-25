@@ -102,7 +102,7 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `tailored_resume_${job.company.replace(/\s+/g, '_')}.docx`;
+      a.download = `tailored_resume_${job.company.replace(/\s+/g, '_')}.pdf`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -217,7 +217,7 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
             <div className="py-12 flex flex-col items-center gap-4 animate-fade-in">
               <div className="w-10 h-10 border-[3px] border-slate-200 border-t-maple rounded-full animate-spin" />
               <div className="text-center">
-                <p className="text-sm font-medium text-slate-700">Analyzing your resume with GPT-4o…</p>
+                <p className="text-sm font-medium text-slate-700">Analyzing your resume with AI…</p>
                 <p className="text-xs text-slate-400 mt-1">Matching keywords for {job.title}</p>
               </div>
             </div>
@@ -317,7 +317,7 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
                       <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                     </svg>
                   )}
-                  Download DOCX
+                  Download PDF
                 </button>
                 <a
                   href={job.url}

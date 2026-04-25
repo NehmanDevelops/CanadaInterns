@@ -1,8 +1,8 @@
 """
 resume.py — AI-powered resume tailoring endpoints.
 
-- POST /api/resume/analyze: Extracts text, sends to Gemini, returns diff + ATS scores
-- POST /api/resume/download: Applies changes and returns a formatted DOCX
+- POST /api/resume/analyze: Extracts text, sends to Groq LLM, returns diff + ATS scores
+- POST /api/resume/download: Applies changes directly on the PDF (preserves formatting)
 - GET  /api/resume/keywords: Extracts top ATS keywords from a job description
 """
 
@@ -15,10 +15,8 @@ from collections import Counter
 from typing import Optional
 
 import httpx
+import fitz  # PyMuPDF
 import pdfplumber
-from docx import Document
-from docx.shared import Pt, Inches
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from fastapi import APIRouter, File, Form, UploadFile, Query
 from fastapi.responses import StreamingResponse
 
@@ -215,19 +213,58 @@ async def analyze_resume(
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT 2: Download tailored resume as DOCX
+# ENDPOINT 2: Download tailored resume as PDF (preserves original formatting)
 # ---------------------------------------------------------------------------
+def _detect_font_size(page: fitz.Page, rect: fitz.Rect) -> float:
+    """Detect the font size of text within a given rectangle."""
+    blocks = page.get_text("dict", clip=rect).get("blocks", [])
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if span.get("size"):
+                    return span["size"]
+    return 10.0  # fallback
+
+
+def _detect_font_name(page: fitz.Page, rect: fitz.Rect) -> str:
+    """Detect the font name of text within a given rectangle."""
+    blocks = page.get_text("dict", clip=rect).get("blocks", [])
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                if span.get("font"):
+                    return span["font"]
+    return "helv"  # fallback (Helvetica)
+
+
+def _detect_font_color(page: fitz.Page, rect: fitz.Rect) -> tuple:
+    """Detect the font color of text within a given rectangle."""
+    blocks = page.get_text("dict", clip=rect).get("blocks", [])
+    for block in blocks:
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                c = span.get("color", 0)
+                if isinstance(c, int):
+                    # Convert integer color to RGB tuple (0-1 range)
+                    r = ((c >> 16) & 0xFF) / 255.0
+                    g = ((c >> 8) & 0xFF) / 255.0
+                    b = (c & 0xFF) / 255.0
+                    return (r, g, b)
+    return (0, 0, 0)  # fallback to black
+
+
 @router.post("/download")
 async def download_resume(
     resume: UploadFile = File(...),
     changes: str = Form(...),
 ):
     """
-    Apply AI-suggested changes to a resume and return as a formatted DOCX.
+    Apply AI-suggested changes directly on the original PDF.
+    Preserves all formatting, layout, fonts, and structure.
+    Works best with single-column PDF resumes.
     """
-    # 1. Extract text
+    # 1. Read the original PDF
     file_bytes = await resume.read()
-    resume_text = _extract_pdf_text(file_bytes)
 
     # 2. Parse changes
     try:
@@ -235,74 +272,62 @@ async def download_resume(
     except json.JSONDecodeError:
         return {"error": "Invalid changes JSON"}
 
-    # 3. Apply replacements
-    modified_text = resume_text
-    for change in change_list:
-        original = change.get("original", "")
-        replacement = change.get("replacement", "")
-        if original:
-            modified_text = modified_text.replace(original, replacement)
+    # 3. Open with PyMuPDF and apply replacements
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
 
-    # 4. Build DOCX
-    doc = Document()
+    for page in doc:
+        for change in change_list:
+            original = change.get("original", "")
+            replacement = change.get("replacement", "")
+            if not original or not replacement:
+                continue
 
-    # Set default font
-    style = doc.styles["Normal"]
-    font = style.font
-    font.name = "Calibri"
-    font.size = Pt(11)
+            # Search using first 60 chars (handles line-wrapped text)
+            search_text = original[:60]
+            areas = page.search_for(search_text)
 
-    # Set margins (1 inch)
-    for section in doc.sections:
-        section.top_margin = Inches(1)
-        section.bottom_margin = Inches(1)
-        section.left_margin = Inches(1)
-        section.right_margin = Inches(1)
+            if not areas:
+                # Try shorter snippet for better matching
+                search_text = original[:30]
+                areas = page.search_for(search_text)
 
-    # Parse text into structured sections
-    lines = modified_text.split("\n")
-    for line in lines:
-        stripped = line.strip()
-        if not stripped:
-            continue
+            for rect in areas:
+                # Detect original text properties
+                font_size = _detect_font_size(page, rect)
+                font_color = _detect_font_color(page, rect)
 
-        # Detect section headers (all caps or short bold-looking lines)
-        is_header = (
-            stripped.isupper()
-            and len(stripped) < 60
-            and len(stripped) > 2
-        )
+                # Expand rect slightly to cover full text area
+                # (search_for may only cover partial text)
+                expanded = fitz.Rect(
+                    rect.x0,
+                    rect.y0 - 1,
+                    page.rect.width - rect.x0,  # extend to right margin
+                    rect.y1 + 1,
+                )
 
-        if is_header:
-            para = doc.add_paragraph()
-            run = para.add_run(stripped)
-            run.bold = True
-            run.font.size = Pt(12)
-            run.font.name = "Calibri"
-            para.space_after = Pt(4)
-            para.space_before = Pt(12)
-        elif stripped.startswith(("•", "-", "–", "▪", "►", "○")):
-            # Bullet point
-            clean = stripped.lstrip("•-–▪►○ ")
-            para = doc.add_paragraph(clean, style="List Bullet")
-            for run in para.runs:
-                run.font.name = "Calibri"
-                run.font.size = Pt(11)
-        else:
-            para = doc.add_paragraph(stripped)
-            for run in para.runs:
-                run.font.name = "Calibri"
-                run.font.size = Pt(11)
+                # White out original text
+                page.draw_rect(expanded, color=(1, 1, 1), fill=(1, 1, 1))
 
-    # 5. Save to buffer and return
+                # Insert replacement text at the same position
+                # Use a text writer for better control
+                text_point = fitz.Point(rect.x0, rect.y0 + font_size * 0.85)
+                page.insert_text(
+                    text_point,
+                    replacement,
+                    fontsize=font_size,
+                    color=font_color,
+                )
+
+    # 4. Save to buffer and return as PDF
     buffer = io.BytesIO()
     doc.save(buffer)
+    doc.close()
     buffer.seek(0)
 
     return StreamingResponse(
         buffer,
-        media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": "attachment; filename=tailored_resume.docx"},
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=tailored_resume.pdf"},
     )
 
 
