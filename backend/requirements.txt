@@ -1,8 +1,9 @@
 fastapi
-uvicorn
+uvicorn[standard]
+httpx
+supabase
+python-dotenv
+apscheduler
 python-docx
 PyMuPDF
 openai
-supabase-py
-requests
-python-dotenv
