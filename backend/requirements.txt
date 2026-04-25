@@ -1,9 +1,11 @@
 fastapi
 uvicorn[standard]
 httpx
-supabase
 python-dotenv
 apscheduler
+websockets==15.0.1
+supabase
+pdfplumber
 python-docx
-PyMuPDF
 openai
+python-multipart

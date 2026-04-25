@@ -18,6 +18,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
 from crawler import run_crawler
+from resume import router as resume_router
 
 load_dotenv()
 
@@ -91,6 +92,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.include_router(resume_router)
 
 
 # ---------------------------------------------------------------------------
