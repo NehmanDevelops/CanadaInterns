@@ -114,7 +114,7 @@ async def get_jobs(
     Return jobs with optional filters.
     Results ordered by first_seen descending (newest discoveries first).
     """
-    url = f"{SUPABASE_REST}/jobs?select=*&order=first_seen.desc&offset={offset}&limit={limit}"
+    url = f"{SUPABASE_REST}/jobs?select=*&order=posted_at.desc.nullslast&offset={offset}&limit={limit}"
     if location:
         url += f"&location=ilike.*{location}*"
     if field:
@@ -135,7 +135,7 @@ async def get_latest_jobs(
     country: Optional[str] = Query(None, description="Filter by country"),
 ):
     """Return the 25 most recently discovered jobs."""
-    url = f"{SUPABASE_REST}/jobs?select=*&order=first_seen.desc&limit=25&is_active=eq.true"
+    url = f"{SUPABASE_REST}/jobs?select=*&order=posted_at.desc.nullslast&limit=25&is_active=eq.true"
     if country:
         url += f"&country=eq.{country}"
 
