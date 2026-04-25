@@ -7,5 +7,4 @@ websockets==15.0.1
 supabase
 pdfplumber
 python-docx
-openai
 python-multipart
