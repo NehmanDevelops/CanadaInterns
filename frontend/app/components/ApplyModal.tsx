@@ -99,10 +99,12 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
       if (!res.ok) throw new Error('Download failed');
 
       const blob = await res.blob();
+      const contentType = res.headers.get('content-type') || '';
+      const ext = contentType.includes('pdf') ? '.pdf' : '.docx';
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `tailored_resume_${job.company.replace(/\s+/g, '_')}.pdf`;
+      a.download = `tailored_resume_${job.company.replace(/\s+/g, '_')}${ext}`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -317,7 +319,7 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
                       <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
                     </svg>
                   )}
-                  Download PDF
+                  Download Resume
                 </button>
                 <a
                   href={job.url}

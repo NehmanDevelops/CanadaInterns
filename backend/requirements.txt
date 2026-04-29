@@ -6,5 +6,6 @@ apscheduler
 websockets==15.0.1
 supabase
 pdfplumber
-pymupdf
+python-docx
+docx2pdf
 python-multipart
