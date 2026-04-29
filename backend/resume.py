@@ -64,12 +64,14 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> str:
 # PDF text extraction
 # ---------------------------------------------------------------------------
 def _extract_pdf_text(file_bytes: bytes) -> str:
+    """Extract all text from a PDF using PyMuPDF (same engine as tailor)."""
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
     text_parts: list[str] = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page in pdf.pages:
-            page_text = page.extract_text()
-            if page_text:
-                text_parts.append(page_text)
+    for page in doc:
+        page_text = page.get_text("text")
+        if page_text:
+            text_parts.append(page_text)
+    doc.close()
     return "\n".join(text_parts)
 
 
@@ -258,25 +260,62 @@ def _build_span_index(page) -> list[dict]:
 
 
 def _find_spans_for_text(spans: list[dict], search_text: str) -> list[dict]:
-    """Find consecutive spans whose combined text contains search_text."""
-    search_clean = search_text.strip()
+    """
+    Find spans matching search_text by building a concatenated page text
+    and mapping character offsets back to spans.
+
+    This solves the fragmented-span problem: PDF text is split across many
+    tiny spans (per-word or per-phrase), so we concat them all, search the
+    combined string, then figure out which spans are covered.
+    """
+    search_clean = re.sub(r"\s+", " ", search_text.strip())
     if not search_clean:
         return []
 
-    search_norm = re.sub(r"\s+", " ", search_clean)
+    # Build concatenated text with span boundary tracking
+    # Each entry: (start_char_offset, end_char_offset, span_index)
+    full_text = ""
+    span_map = []  # list of (char_start, char_end, span_index)
 
-    for i in range(len(spans)):
-        concat = ""
-        window = []
-        for j in range(i, min(i + 15, len(spans))):
-            concat += spans[j]["text"]
-            window.append(spans[j])
+    for idx, span in enumerate(spans):
+        start = len(full_text)
+        full_text += span["text"]
+        end = len(full_text)
+        span_map.append((start, end, idx))
+        # Add space between spans (simulates word gaps)
+        full_text += " "
 
-            concat_norm = re.sub(r"\s+", " ", concat.strip())
+    # Normalize for comparison
+    full_norm = re.sub(r"\s+", " ", full_text.strip()).lower()
+    search_norm = search_clean.lower()
 
-            if search_norm[:50] in concat_norm or concat_norm in search_norm:
-                if len(concat_norm) >= min(len(search_norm), 20):
-                    return window
+    # Try increasingly shorter search prefixes
+    for search_len in [len(search_norm), 60, 40, 25]:
+        snippet = search_norm[:search_len]
+        if len(snippet) < 15:
+            continue
+
+        pos = full_norm.find(snippet)
+        if pos == -1:
+            continue
+
+        # Map character position back to spans
+        # Find which spans overlap with [pos, pos + len(snippet)]
+        match_start = pos
+        match_end = pos + len(snippet)
+
+        matched_spans = []
+        for char_start, char_end, span_idx in span_map:
+            # Adjust for the spaces we added between spans
+            adj_start = char_start + span_idx  # each prior span added 1 space
+            adj_end = char_end + span_idx
+
+            if adj_end > match_start and adj_start < match_end:
+                matched_spans.append(spans[span_idx])
+
+        if matched_spans:
+            return matched_spans
+
     return []
 
 
@@ -306,13 +345,17 @@ def tailor_pdf(pdf_bytes: bytes, changes: list[dict]) -> dict:
         logger.info(f"--- Processing change ---")
         logger.info(f"  SEARCH: '{original[:80]}...'")
 
+
         found = False
         for page_num, page in enumerate(doc):
             all_spans = _build_span_index(page)
-            matched = _find_spans_for_text(all_spans, original)
 
-            if not matched:
-                matched = _find_spans_for_text(all_spans, original[:40])
+            # Debug: log what text is on this page
+            page_text = " ".join(s["text"] for s in all_spans)
+            if page_num == 0 and change == changes[0]:
+                logger.info(f"  PAGE {page_num+1} text ({len(all_spans)} spans): '{page_text[:200]}...'")
+
+            matched = _find_spans_for_text(all_spans, original)
             if not matched:
                 continue
 
