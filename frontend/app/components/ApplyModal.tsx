@@ -31,6 +31,7 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
   const [result, setResult] = useState<AnalysisResult | null>(null);
   const [errorMsg, setErrorMsg] = useState('');
   const [downloading, setDownloading] = useState(false);
+  const [downloadStatus, setDownloadStatus] = useState<{applied: number; requested: number; failed: string[]} | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const handleDrop = (e: React.DragEvent) => {
@@ -82,6 +83,7 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
   const handleDownload = async () => {
     if (!file || !result) return;
     setDownloading(true);
+    setDownloadStatus(null);
 
     try {
       const formData = new FormData();
@@ -98,7 +100,20 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
 
       if (!res.ok) throw new Error('Download failed');
 
-      const blob = await res.blob();
+      const data = await res.json();
+
+      if (data.error) throw new Error(data.error);
+
+      // Set status
+      setDownloadStatus({
+        applied: data.changes_applied,
+        requested: data.changes_requested,
+        failed: data.failed_changes || [],
+      });
+
+      // Decode base64 PDF and trigger download
+      const pdfBytes = Uint8Array.from(atob(data.pdf_base64), c => c.charCodeAt(0));
+      const blob = new Blob([pdfBytes], { type: 'application/pdf' });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -299,6 +314,21 @@ export default function ApplyModal({ job, onClose }: ApplyModalProps) {
                       <span key={i} className="px-2 py-0.5 text-2xs bg-red-50 text-red-400 rounded font-medium">{kw}</span>
                     ))}
                   </div>
+                </div>
+              )}
+
+              {/* Download Status */}
+              {downloadStatus && (
+                <div className={`p-3 rounded-lg text-xs ${downloadStatus.applied === downloadStatus.requested ? 'bg-teal-light text-teal' : 'bg-amber-50 text-amber-700'}`}>
+                  <p className="font-semibold">Applied {downloadStatus.applied} of {downloadStatus.requested} changes</p>
+                  {downloadStatus.failed.length > 0 && (
+                    <div className="mt-2 space-y-1">
+                      <p className="text-red-500 font-medium">Failed to find in PDF:</p>
+                      {downloadStatus.failed.map((f, i) => (
+                        <p key={i} className="text-red-400 truncate">• {f.substring(0, 80)}…</p>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 

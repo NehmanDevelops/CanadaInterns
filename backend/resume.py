@@ -2,11 +2,12 @@
 resume.py — AI-powered resume tailoring endpoints.
 
 - POST /api/resume/analyze:  Extracts text, sends to Groq LLM, returns diff + ATS scores
-- POST /api/resume/download: Custom PDF-to-PDF tailoring (PyMuPDF insert_textbox)
+- POST /api/resume/download: Custom PDF-to-PDF tailoring with detailed results
 - POST /api/resume/tailor:   Alias for /download
 - GET  /api/resume/keywords: Extracts top ATS keywords from a job description
 """
 
+import base64
 import io
 import json
 import logging
@@ -26,17 +27,15 @@ logger = logging.getLogger("resume")
 router = APIRouter(prefix="/api/resume", tags=["resume"])
 
 # ---------------------------------------------------------------------------
-# Groq API config (free tier — no billing required)
+# Groq API config
 # ---------------------------------------------------------------------------
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL: str = "https://api.groq.com/openai/v1/chat/completions"
 
 
 async def _call_llm(system_prompt: str, user_prompt: str) -> str:
-    """Call Groq (Llama 3.3 70B) via their OpenAI-compatible REST API."""
     if not GROQ_API_KEY:
         raise ValueError("GROQ_API_KEY not set in environment")
-
     payload = {
         "model": "llama-3.3-70b-versatile",
         "messages": [
@@ -47,7 +46,6 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> str:
         "max_tokens": 2000,
         "response_format": {"type": "json_object"},
     }
-
     async with httpx.AsyncClient(timeout=60) as client:
         resp = await client.post(
             GROQ_URL,
@@ -59,15 +57,13 @@ async def _call_llm(system_prompt: str, user_prompt: str) -> str:
         )
         resp.raise_for_status()
         data = resp.json()
-
     return data["choices"][0]["message"]["content"]
 
 
 # ---------------------------------------------------------------------------
-# PDF text extraction (plain text for AI analysis)
+# PDF text extraction
 # ---------------------------------------------------------------------------
 def _extract_pdf_text(file_bytes: bytes) -> str:
-    """Extract all text from a PDF using pdfplumber."""
     text_parts: list[str] = []
     with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
         for page in pdf.pages:
@@ -100,24 +96,20 @@ STOP_WORDS = {
 
 
 def _extract_keywords(text: str, top_n: int = 20) -> list[str]:
-    """Extract the most relevant ATS keywords from text."""
     words = re.findall(r"[a-zA-Z+#.]+(?:\s[a-zA-Z+#.]+)?", text.lower())
     filtered = [w.strip() for w in words if w.strip() not in STOP_WORDS and len(w.strip()) > 2]
-
     bigrams = []
     word_list = text.lower().split()
     for i in range(len(word_list) - 1):
         w1, w2 = word_list[i].strip(",.;:()"), word_list[i + 1].strip(",.;:()")
         if w1 not in STOP_WORDS and w2 not in STOP_WORDS and len(w1) > 2 and len(w2) > 2:
             bigrams.append(f"{w1} {w2}")
-
     all_terms = filtered + bigrams
     counts = Counter(all_terms)
     return [term for term, _ in counts.most_common(top_n)]
 
 
 def _calculate_ats_score(resume_text: str, keywords: list[str]) -> tuple[int, list[str], list[str]]:
-    """Calculate ATS match score. Returns (score, matched, missing)."""
     resume_lower = resume_text.lower()
     matched = [kw for kw in keywords if kw.lower() in resume_lower]
     missing = [kw for kw in keywords if kw.lower() not in resume_lower]
@@ -155,17 +147,13 @@ async def analyze_resume(
     resume: UploadFile = File(...),
     job_description: str = Form(...),
 ):
-    """
-    Analyze a resume against a job description.
-    Returns AI-suggested changes and ATS score before/after.
-    """
     file_bytes = await resume.read()
     resume_text = _extract_pdf_text(file_bytes)
     if not resume_text.strip():
         return {"error": "Could not extract text from the uploaded PDF."}
 
     keywords = _extract_keywords(job_description, top_n=20)
-    ats_before, matched_before, missing_before = _calculate_ats_score(resume_text, keywords)
+    ats_before, _, _ = _calculate_ats_score(resume_text, keywords)
 
     try:
         raw = await _call_llm(
@@ -186,10 +174,10 @@ async def analyze_resume(
 
     modified_text = resume_text
     for change in changes:
-        original = change.get("original", "")
-        replacement = change.get("replacement", "")
-        if original:
-            modified_text = modified_text.replace(original, replacement)
+        orig = change.get("original", "")
+        repl = change.get("replacement", "")
+        if orig:
+            modified_text = modified_text.replace(orig, repl)
 
     ats_after, matched_after, missing_after = _calculate_ats_score(modified_text, keywords)
 
@@ -203,10 +191,8 @@ async def analyze_resume(
 
 
 # ---------------------------------------------------------------------------
-# PDF-to-PDF tailoring engine (custom PyMuPDF approach)
+# PDF-to-PDF tailoring engine
 # ---------------------------------------------------------------------------
-
-# Map common PDF font names to fitz built-in fonts
 FONT_MAP = {
     "times": "tiro", "timesnewroman": "tiro", "timesnewromanps": "tiro",
     "times-roman": "tiro", "tiro": "tiro", "cambria": "tiro",
@@ -219,54 +205,40 @@ FONT_MAP = {
     "montserrat": "helv", "poppins": "helv",
     "courier": "cour", "couriernew": "cour", "cour": "cour",
 }
-
 SERIF_HINTS = {"times", "roman", "serif", "garamond", "georgia", "cambria",
                "palatino", "book", "antiqua", "tiro", "caslon", "baskerville"}
 
 
 def _map_font(pdf_font_name: str) -> str:
-    """Map a PDF font name to closest fitz built-in font."""
     clean = re.sub(r"[\s\-_,]+", "", pdf_font_name.lower())
     clean = re.sub(r"(bold|italic|oblique|regular|medium|light|condensed|"
                    r"semibold|extrabold|thin|black|mt|ps|it|bi|bo)", "", clean).strip()
-
     if clean in FONT_MAP:
         return FONT_MAP[clean]
     for hint in SERIF_HINTS:
         if hint in clean:
-            logger.info(f"Font '{pdf_font_name}' → tiro (serif match)")
             return "tiro"
-    logger.info(f"Font '{pdf_font_name}' → helv (sans-serif fallback)")
     return "helv"
 
 
-def _int_to_rgb(color_int: int) -> tuple:
-    """Convert integer color to (r, g, b) tuple in 0-1 range."""
-    r = ((color_int >> 16) & 0xFF) / 255.0
-    g = ((color_int >> 8) & 0xFF) / 255.0
-    b = (color_int & 0xFF) / 255.0
-    return (r, g, b)
+def _int_to_rgb(c: int) -> tuple:
+    return (((c >> 16) & 0xFF) / 255.0, ((c >> 8) & 0xFF) / 255.0, (c & 0xFF) / 255.0)
 
 
 def _get_font_suffix(flags: int) -> str:
-    """Get bold/italic suffix from span flags."""
-    is_bold = bool(flags & (1 << 4))
-    is_italic = bool(flags & (1 << 1))
-    if is_bold and is_italic:
-        return "bi"
-    elif is_bold:
-        return "bo"
-    elif is_italic:
-        return "it"
+    b = bool(flags & (1 << 4))
+    i = bool(flags & (1 << 1))
+    if b and i: return "bi"
+    if b: return "bo"
+    if i: return "it"
     return ""
 
 
 def _build_span_index(page) -> list[dict]:
-    """Extract all text spans from a page with their full properties."""
     spans = []
     blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
     for block in blocks:
-        if block.get("type") != 0:  # text blocks only
+        if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
             for span in line.get("spans", []):
@@ -275,7 +247,7 @@ def _build_span_index(page) -> list[dict]:
                     continue
                 spans.append({
                     "text": text,
-                    "bbox": span["bbox"],  # (x0, y0, x1, y1)
+                    "bbox": span["bbox"],
                     "font": span.get("font", "Helvetica"),
                     "size": span.get("size", 10.0),
                     "color": span.get("color", 0),
@@ -286,15 +258,13 @@ def _build_span_index(page) -> list[dict]:
 
 
 def _find_spans_for_text(spans: list[dict], search_text: str) -> list[dict]:
-    """
-    Find the sequence of consecutive spans whose combined text
-    contains the search_text. Returns the matched spans.
-    """
+    """Find consecutive spans whose combined text contains search_text."""
     search_clean = search_text.strip()
     if not search_clean:
         return []
 
-    # Try to find a window of spans whose concatenated text contains search_text
+    search_norm = re.sub(r"\s+", " ", search_clean)
+
     for i in range(len(spans)):
         concat = ""
         window = []
@@ -302,20 +272,15 @@ def _find_spans_for_text(spans: list[dict], search_text: str) -> list[dict]:
             concat += spans[j]["text"]
             window.append(spans[j])
 
-            # Normalize whitespace for comparison
             concat_norm = re.sub(r"\s+", " ", concat.strip())
-            search_norm = re.sub(r"\s+", " ", search_clean)
 
             if search_norm[:50] in concat_norm or concat_norm in search_norm:
-                # Verify enough overlap
                 if len(concat_norm) >= min(len(search_norm), 20):
                     return window
-
     return []
 
 
 def _compute_bounding_rect(spans: list[dict]) -> fitz.Rect:
-    """Compute the bounding rectangle of a list of spans."""
     x0 = min(s["bbox"][0] for s in spans)
     y0 = min(s["bbox"][1] for s in spans)
     x1 = max(s["bbox"][2] for s in spans)
@@ -323,108 +288,105 @@ def _compute_bounding_rect(spans: list[dict]) -> fitz.Rect:
     return fitz.Rect(x0, y0, x1, y1)
 
 
-def tailor_pdf(pdf_bytes: bytes, changes: list[dict]) -> bytes:
+def tailor_pdf(pdf_bytes: bytes, changes: list[dict]) -> dict:
     """
-    Core PDF tailoring function.
-    Opens the original PDF, finds each original text, whites it out,
-    and inserts the replacement text at the exact same position
-    using insert_textbox for proper wrapping.
+    Core PDF tailoring engine with detailed logging.
+    Returns dict with pdf_bytes + per-change results.
     """
     doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+    applied = []
+    failed = []
 
-    for page in doc:
-        # Build full span index for this page
-        all_spans = _build_span_index(page)
+    for change in changes:
+        original = change.get("original", "").strip()
+        replacement = change.get("replacement", "").strip()
+        if not original or not replacement:
+            continue
 
-        for change in changes:
-            original = change.get("original", "").strip()
-            replacement = change.get("replacement", "").strip()
-            if not original or not replacement:
-                continue
+        logger.info(f"--- Processing change ---")
+        logger.info(f"  SEARCH: '{original[:80]}...'")
 
-            # Find spans matching original text
+        found = False
+        for page_num, page in enumerate(doc):
+            all_spans = _build_span_index(page)
             matched = _find_spans_for_text(all_spans, original)
 
             if not matched:
-                # Try with shorter text
                 matched = _find_spans_for_text(all_spans, original[:40])
-
             if not matched:
-                logger.warning(f"Could not find text in PDF: '{original[:50]}...'")
                 continue
 
-            # Extract font properties from first matched span
+            found = True
             ref = matched[0]
-            font_name_raw = ref["font"]
-            font_size = ref["size"]
-            color_int = ref["color"]
-            flags = ref["flags"]
-
-            font_base = _map_font(font_name_raw)
-            suffix = _get_font_suffix(flags)
+            font_base = _map_font(ref["font"])
+            suffix = _get_font_suffix(ref["flags"])
             font_name = font_base + suffix if suffix else font_base
+            font_size = ref["size"]
+            color = _int_to_rgb(ref["color"]) if isinstance(ref["color"], int) else (0, 0, 0)
 
-            color = _int_to_rgb(color_int) if isinstance(color_int, int) else (0, 0, 0)
-
-            # Compute bounding rect of all matched spans
             bounds = _compute_bounding_rect(matched)
+            logger.info(f"  FOUND page {page_num+1} | rect=({bounds.x0:.0f},{bounds.y0:.0f},{bounds.x1:.0f},{bounds.y1:.0f})")
+            logger.info(f"  Font: {ref['font']} → {font_name} @ {font_size}pt")
+            logger.info(f"  Spans: {len(matched)} | text='{' '.join(s['text'][:15] for s in matched)}'")
 
-            # Extend to right margin (bullets often span full width)
-            right_margin = page.rect.width - bounds.x0
-            text_rect = fitz.Rect(
-                bounds.x0,
-                bounds.y0,
-                min(bounds.x0 + right_margin, page.rect.width - 30),
-                bounds.y1,
-            )
+            text_rect = fitz.Rect(bounds.x0, bounds.y0, page.rect.width - 30, bounds.y1)
 
-            # --- White out all matched span areas ---
+            # White out
             for span in matched:
-                bbox = span["bbox"]
-                whiteout = fitz.Rect(
-                    bbox[0] - 0.5,
-                    bbox[1] - 0.5,
-                    page.rect.width - 30,  # extend to right margin
-                    bbox[3] + 0.5,
-                )
-                page.draw_rect(whiteout, color=(1, 1, 1), fill=(1, 1, 1))
+                b = span["bbox"]
+                page.draw_rect(fitz.Rect(b[0]-0.5, b[1]-0.5, page.rect.width-30, b[3]+0.5),
+                               color=(1,1,1), fill=(1,1,1))
 
-            # --- Insert replacement text ---
-            # Use insert_textbox for automatic word wrapping within bounds
-            adjusted_size = font_size
-
-            # Try fitting text, reduce size if needed (max -1pt)
-            for attempt in range(3):
-                rc = page.insert_textbox(
-                    text_rect,
-                    replacement,
-                    fontname=font_name,
-                    fontsize=adjusted_size,
-                    color=color,
-                    align=fitz.TEXT_ALIGN_LEFT,
-                )
+            # Insert with auto-shrink
+            adjusted = font_size
+            ok = False
+            for _ in range(4):
+                rc = page.insert_textbox(text_rect, replacement,
+                                         fontname=font_name, fontsize=adjusted,
+                                         color=color, align=fitz.TEXT_ALIGN_LEFT)
                 if rc >= 0:
-                    # Text fit successfully
+                    ok = True
+                    logger.info(f"  INSERT OK @ {adjusted}pt (rc={rc:.1f})")
                     break
-                else:
-                    # rc < 0 means text didn't fit, reduce size
-                    adjusted_size -= 0.5
-                    # White out again (previous attempt left partial text)
-                    for span in matched:
-                        bbox = span["bbox"]
-                        page.draw_rect(
-                            fitz.Rect(bbox[0] - 0.5, bbox[1] - 0.5,
-                                      page.rect.width - 30, bbox[3] + 0.5),
-                            color=(1, 1, 1), fill=(1, 1, 1),
-                        )
+                adjusted -= 0.5
+                # Re-white
+                for span in matched:
+                    b = span["bbox"]
+                    page.draw_rect(fitz.Rect(b[0]-0.5, b[1]-0.5, page.rect.width-30, b[3]+0.5),
+                                   color=(1,1,1), fill=(1,1,1))
 
-    result = doc.tobytes()
+            if not ok:
+                logger.warning(f"  INSERT FAILED even at {adjusted}pt")
+
+            applied.append({
+                "original": original[:80],
+                "replacement": replacement[:80],
+                "page": page_num + 1,
+                "success": ok,
+            })
+            break
+
+        if not found:
+            logger.warning(f"  NOT FOUND: '{original[:60]}'")
+            failed.append(original)
+
+    logger.info(f"=== SUMMARY: {len(applied)} applied, {len(failed)} failed of {len(changes)} ===")
+    for f in failed:
+        logger.info(f"  MISS: '{f[:60]}'")
+
+    pdf_out = doc.tobytes()
     doc.close()
-    return result
+    return {
+        "pdf_bytes": pdf_out,
+        "changes_requested": len(changes),
+        "changes_applied": len(applied),
+        "applied_changes": applied,
+        "failed_changes": failed,
+    }
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT 2: Download / Tailor — Custom PDF-to-PDF
+# ENDPOINT 2: Download / Tailor
 # ---------------------------------------------------------------------------
 @router.post("/download")
 @router.post("/tailor")
@@ -432,11 +394,7 @@ async def download_resume(
     resume: UploadFile = File(...),
     changes: str = Form(...),
 ):
-    """
-    Custom PDF-to-PDF tailoring. Finds original bullet text in the PDF,
-    whites it out, and inserts replacement text at exact same coordinates
-    with matching font, size, and color. Returns modified PDF.
-    """
+    """Returns JSON: base64 PDF + metadata about applied/failed changes."""
     file_bytes = await resume.read()
 
     try:
@@ -445,28 +403,28 @@ async def download_resume(
         return {"error": "Invalid changes JSON"}
 
     try:
-        pdf_bytes = tailor_pdf(file_bytes, change_list)
+        result = tailor_pdf(file_bytes, change_list)
     except Exception as exc:
         logger.error(f"PDF tailoring failed: {exc}", exc_info=True)
         return {"error": f"PDF tailoring failed: {str(exc)}"}
 
-    buffer = io.BytesIO(pdf_bytes)
-    buffer.seek(0)
+    pdf_b64 = base64.b64encode(result["pdf_bytes"]).decode("utf-8")
 
-    return StreamingResponse(
-        buffer,
-        media_type="application/pdf",
-        headers={"Content-Disposition": "attachment; filename=tailored_resume.pdf"},
-    )
+    return {
+        "pdf_base64": pdf_b64,
+        "changes_requested": result["changes_requested"],
+        "changes_applied": result["changes_applied"],
+        "applied_changes": result["applied_changes"],
+        "failed_changes": result["failed_changes"],
+    }
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT 3: Extract keywords from job description
+# ENDPOINT 3: Extract keywords
 # ---------------------------------------------------------------------------
 @router.get("/keywords")
 async def get_keywords(
     job_description: str = Query(..., description="The job description to extract keywords from"),
 ):
-    """Extract top 20 ATS keywords from a job description."""
     keywords = _extract_keywords(job_description, top_n=20)
     return {"keywords": keywords, "count": len(keywords)}
