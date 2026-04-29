@@ -214,103 +214,15 @@ async def analyze_resume(
 
 # ---------------------------------------------------------------------------
 # ENDPOINT 2: Download tailored resume as PDF (preserves original formatting)
+# Uses PyMuPDF's built-in REDACTION system for clean text replacement
 # ---------------------------------------------------------------------------
 
-# Map PDF font names to closest available fitz built-in font
-FONT_MAP = {
-    "timesnewroman": "tiro",
-    "timesnewromanps": "tiro",
-    "times": "tiro",
-    "times-roman": "tiro",
-    "tiro": "tiro",
-    "helvetica": "helv",
-    "arial": "helv",
-    "arialmt": "helv",
-    "helv": "helv",
-    "courier": "cour",
-    "couriernew": "cour",
-    "cour": "cour",
-    "calibri": "helv",
-    "cambria": "tiro",
-    "garamond": "tiro",
-    "georgia": "tiro",
-    "palatino": "tiro",
-    "bookantiqua": "tiro",
-    "verdana": "helv",
-    "tahoma": "helv",
-    "trebuchet": "helv",
-    "trebuchetms": "helv",
-    "segoeui": "helv",
-    "roboto": "helv",
-    "inter": "helv",
-    "lato": "helv",
-    "opensans": "helv",
-    "sourcesanspro": "helv",
-    "montserrat": "helv",
-    "poppins": "helv",
-    "nunito": "helv",
-    "raleway": "helv",
-}
-
-# Common serif font name fragments (for fallback detection)
-SERIF_HINTS = {"times", "roman", "serif", "garamond", "georgia", "cambria",
-               "palatino", "book", "antiqua", "tiro", "caslon", "baskerville"}
+BULLET_CHARS = "\u2022-\u2013\u2014*\u25aa\u25ba\u25cb\u25e6\u2023\u2043\u00b7"
 
 
-def _map_font(pdf_font_name: str) -> str:
-    """Map a PDF font name to the closest available fitz built-in font."""
-    # Normalize: lowercase, strip spaces/hyphens/dashes
-    clean = re.sub(r"[\s\-_,]+", "", pdf_font_name.lower())
-    # Remove style suffixes like -Bold, -Italic, -BoldItalic
-    clean = re.sub(r"(bold|italic|oblique|regular|medium|light|condensed|semibold|extrabold|thin|black|mt|ps)", "", clean)
-    clean = clean.strip()
-
-    if clean in FONT_MAP:
-        return FONT_MAP[clean]
-
-    # Check if it looks like a serif font
-    for hint in SERIF_HINTS:
-        if hint in clean:
-            logger.warning(f"Custom font detected: {pdf_font_name}, using closest match (tiro/serif)")
-            return "tiro"
-
-    # Default to sans-serif
-    logger.warning(f"Custom font detected: {pdf_font_name}, using closest match (helv/sans-serif)")
-    return "helv"
-
-
-def _int_color_to_rgb(color_int: int) -> tuple:
-    """Convert an integer color value to an RGB tuple (0-1 range)."""
-    r = ((color_int >> 16) & 0xFF) / 255.0
-    g = ((color_int >> 8) & 0xFF) / 255.0
-    b = (color_int & 0xFF) / 255.0
-    return (r, g, b)
-
-
-def _find_matching_spans(page: fitz.Page, search_text: str) -> list[dict]:
-    """
-    Find all spans in the page whose text contains part of search_text.
-    Returns a list of span dicts with full font properties.
-    """
-    matched_spans = []
-    blocks = page.get_text("dict")["blocks"]
-
-    for block in blocks:
-        for line in block.get("lines", []):
-            for span in line.get("spans", []):
-                span_text = span.get("text", "")
-                # Check if this span's text is part of the search text
-                if span_text.strip() and span_text.strip() in search_text:
-                    matched_spans.append({
-                        "text": span_text,
-                        "font": span.get("font", "Helvetica"),
-                        "size": span.get("size", 10.0),
-                        "color": span.get("color", 0),
-                        "flags": span.get("flags", 0),
-                        "origin": span.get("origin", (0, 0)),
-                        "bbox": span.get("bbox", (0, 0, 0, 0)),
-                    })
-    return matched_spans
+def _strip_bullet(text: str) -> str:
+    """Strip leading bullet characters and whitespace."""
+    return text.lstrip(BULLET_CHARS + " \t")
 
 
 @router.post("/download")
@@ -319,9 +231,8 @@ async def download_resume(
     changes: str = Form(...),
 ):
     """
-    Apply AI-suggested changes directly on the original PDF.
-    Extracts exact font properties from the original text and
-    reinserts replacement text with matching font, size, color, and position.
+    Apply AI-suggested changes directly on the original PDF using
+    PyMuPDF's built-in redaction system. Preserves all formatting.
     Works best with single-column PDF resumes.
     """
     # 1. Read the original PDF
@@ -333,187 +244,49 @@ async def download_resume(
     except json.JSONDecodeError:
         return {"error": "Invalid changes JSON"}
 
-    # 3. Open with PyMuPDF and apply replacements
+    # 3. Open with PyMuPDF and apply redaction-based replacements
     doc = fitz.open(stream=file_bytes, filetype="pdf")
 
     for page in doc:
-        # Pre-extract all text spans with their properties
-        all_spans = []
-        blocks = page.get_text("dict")["blocks"]
-        for block in blocks:
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    all_spans.append(span)
-
         for change in change_list:
             original = change.get("original", "")
             replacement = change.get("replacement", "")
             if not original or not replacement:
                 continue
 
-            # --- Step 1: Find spans that contain the original text ---
-            # Build a concatenated text from consecutive spans to find the match
-            matched_span_indices = []
-            for i, span in enumerate(all_spans):
-                span_text = span.get("text", "").strip()
-                if not span_text:
-                    continue
+            # Try searching with first 60 chars (handles wrapped bullets)
+            search_text = original[:60]
+            hits = page.search_for(search_text)
 
-                # Check if this span starts our search text
-                if span_text[:20] in original[:30] and len(span_text) > 3:
-                    # Found a potential start — collect consecutive spans
-                    concat = ""
-                    indices = []
-                    for j in range(i, min(i + 8, len(all_spans))):
-                        concat += all_spans[j].get("text", "") + " "
-                        indices.append(j)
-                        # Check if we've accumulated enough text
-                        if original[:40] in concat or concat.strip()[:40] in original:
-                            matched_span_indices = indices
-                            break
-                    if matched_span_indices:
-                        break
+            if not hits:
+                # Try without bullet symbols
+                stripped = _strip_bullet(original)[:60]
+                hits = page.search_for(stripped)
 
-            if not matched_span_indices:
-                # Fallback: use search_for with shorter text
-                search_text = original[:50]
-                areas = page.search_for(search_text)
-                if not areas:
-                    search_text = original[:25]
-                    areas = page.search_for(search_text)
-                if not areas:
-                    continue
+            if not hits:
+                # Try even shorter
+                search_text = original[:30]
+                hits = page.search_for(search_text)
 
-                # Use the first match area and detect font from it
-                rect = areas[0]
-                clip_spans = []
-                for span in all_spans:
-                    sbbox = span.get("bbox", (0, 0, 0, 0))
-                    srect = fitz.Rect(sbbox)
-                    if srect.intersects(rect):
-                        clip_spans.append(span)
-
-                if clip_spans:
-                    ref_span = clip_spans[0]
-                else:
-                    # Absolute fallback
-                    ref_span = {
-                        "font": "Helvetica", "size": 10.0,
-                        "color": 0, "flags": 0,
-                        "origin": (rect.x0, rect.y0 + 10),
-                        "bbox": tuple(rect),
-                    }
-
-                # White out all matched areas
-                for area in areas:
-                    expanded = fitz.Rect(
-                        area.x0 - 1, area.y0 - 1,
-                        page.rect.width - 36, area.y1 + 1,
-                    )
-                    page.draw_rect(expanded, color=(1, 1, 1), fill=(1, 1, 1))
-
-                # Also white out any continuation lines
-                for cs in clip_spans:
-                    cb = cs.get("bbox", (0, 0, 0, 0))
-                    page.draw_rect(
-                        fitz.Rect(cb[0] - 1, cb[1] - 1, page.rect.width - 36, cb[3] + 1),
-                        color=(1, 1, 1), fill=(1, 1, 1),
-                    )
-
-                font_size = ref_span["size"]
-                font_name = _map_font(ref_span["font"])
-                color_val = ref_span["color"]
-                font_color = _int_color_to_rgb(color_val) if isinstance(color_val, int) else (0, 0, 0)
-                origin = ref_span["origin"]
-                ref_bbox = ref_span["bbox"]
-                is_bold = bool(ref_span["flags"] & (1 << 4))
-                is_italic = bool(ref_span["flags"] & (1 << 1))
-
-                # Apply bold/italic suffix to font
-                if is_bold and is_italic:
-                    font_name = font_name + "bi"
-                elif is_bold:
-                    font_name = font_name + "bo"
-                elif is_italic:
-                    font_name = font_name + "it"
-
-                # Calculate available width for text
-                right_margin = page.rect.width - 36
-                available_width = right_margin - origin[0]
-
-                # Auto-shrink if replacement is too long
-                adjusted_size = font_size
-                while adjusted_size > 6:
-                    test_length = fitz.get_text_length(replacement, fontname=font_name, fontsize=adjusted_size)
-                    if test_length <= available_width:
-                        break
-                    adjusted_size -= 0.5
-
-                text_point = fitz.Point(origin[0], origin[1])
-                page.insert_text(
-                    text_point,
-                    replacement,
-                    fontname=font_name,
-                    fontsize=adjusted_size,
-                    color=font_color,
-                )
+            if not hits:
                 continue
 
-            # --- Step 2: Extract font properties from matched spans ---
-            ref_span = all_spans[matched_span_indices[0]]
-            font_size = ref_span.get("size", 10.0)
-            font_name_raw = ref_span.get("font", "Helvetica")
-            font_name = _map_font(font_name_raw)
-            color_val = ref_span.get("color", 0)
-            font_color = _int_color_to_rgb(color_val) if isinstance(color_val, int) else (0, 0, 0)
-            origin = ref_span.get("origin", (0, 0))
-            is_bold = bool(ref_span.get("flags", 0) & (1 << 4))
-            is_italic = bool(ref_span.get("flags", 0) & (1 << 1))
-
-            # Apply bold/italic suffix
-            if is_bold and is_italic:
-                font_name = font_name + "bi"
-            elif is_bold:
-                font_name = font_name + "bo"
-            elif is_italic:
-                font_name = font_name + "it"
-
-            # --- Step 3: White out all matched span areas ---
-            for idx in matched_span_indices:
-                span = all_spans[idx]
-                bbox = span.get("bbox", (0, 0, 0, 0))
-                whiteout = fitz.Rect(
-                    bbox[0] - 1,
-                    bbox[1] - 1,
-                    page.rect.width - 36,  # extend to right margin
-                    bbox[3] + 1,
+            for rect in hits:
+                # Add redaction annotation — PyMuPDF handles the erase + replace
+                page.add_redact_annot(
+                    rect,
+                    text=replacement,
+                    fontname="Times-Roman",
+                    fontsize=0,       # 0 = auto-fit to rect
+                    fill=(1, 1, 1),   # white background
+                    text_color=(0, 0, 0),
                 )
-                page.draw_rect(whiteout, color=(1, 1, 1), fill=(1, 1, 1))
 
-            # --- Step 4: Insert replacement at exact same position ---
-            right_margin = page.rect.width - 36
-            available_width = right_margin - origin[0]
+        # Apply all redactions on this page at once
+        page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
 
-            # Auto-shrink fontsize if replacement is longer
-            adjusted_size = font_size
-            while adjusted_size > 6:
-                test_length = fitz.get_text_length(replacement, fontname=font_name, fontsize=adjusted_size)
-                if test_length <= available_width:
-                    break
-                adjusted_size -= 0.5
-
-            text_point = fitz.Point(origin[0], origin[1])
-            page.insert_text(
-                text_point,
-                replacement,
-                fontname=font_name,
-                fontsize=adjusted_size,
-                color=font_color,
-            )
-
-    # 4. Save to buffer and return as PDF
-    buffer = io.BytesIO()
-    doc.save(buffer)
+    # 4. Return as PDF
+    buffer = io.BytesIO(doc.tobytes())
     doc.close()
     buffer.seek(0)
 
