@@ -1,8 +1,9 @@
 """
 resume.py — AI-powered resume tailoring endpoints.
 
-- POST /api/resume/analyze: Extracts text, sends to Groq LLM, returns diff + ATS scores
-- POST /api/resume/download: Rebuilds resume as DOCX mirroring PDF, converts to PDF
+- POST /api/resume/analyze:  Extracts text, sends to Groq LLM, returns diff + ATS scores
+- POST /api/resume/download: Custom PDF-to-PDF tailoring (PyMuPDF insert_textbox)
+- POST /api/resume/tailor:   Alias for /download
 - GET  /api/resume/keywords: Extracts top ATS keywords from a job description
 """
 
@@ -11,19 +12,12 @@ import json
 import logging
 import os
 import re
-import tempfile
-import subprocess
 from collections import Counter
-from pathlib import Path
 from typing import Optional
 
 import httpx
+import fitz  # PyMuPDF
 import pdfplumber
-from docx import Document
-from docx.shared import Pt, Inches, RGBColor, Cm
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from docx.oxml.ns import qn
-from docx.oxml import OxmlElement
 from fastapi import APIRouter, File, Form, UploadFile, Query
 from fastapi.responses import StreamingResponse
 
@@ -33,7 +27,6 @@ router = APIRouter(prefix="/api/resume", tags=["resume"])
 
 # ---------------------------------------------------------------------------
 # Groq API config (free tier — no billing required)
-# Uses Llama 3.3 70B via Groq's OpenAI-compatible endpoint
 # ---------------------------------------------------------------------------
 GROQ_API_KEY: str = os.environ.get("GROQ_API_KEY", "")
 GROQ_URL: str = "https://api.groq.com/openai/v1/chat/completions"
@@ -85,326 +78,6 @@ def _extract_pdf_text(file_bytes: bytes) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PDF structure extraction (with font info for DOCX rebuild)
-# ---------------------------------------------------------------------------
-def _extract_pdf_structure(file_bytes: bytes) -> list[dict]:
-    """
-    Extract structured lines from PDF with font size info.
-    Returns list of dicts: {text, font_size, is_bold, x0, x1, top, page}
-    """
-    lines = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for page_num, page in enumerate(pdf.pages):
-            # Extract characters with their properties
-            chars = page.chars
-            if not chars:
-                text = page.extract_text()
-                if text:
-                    for line_text in text.split("\n"):
-                        if line_text.strip():
-                            lines.append({
-                                "text": line_text.strip(),
-                                "font_size": 10.0,
-                                "is_bold": False,
-                                "x0": 0,
-                                "page": page_num,
-                            })
-                continue
-
-            # Group characters into lines by their top position
-            char_lines: dict[float, list] = {}
-            for char in chars:
-                # Round top to group chars on same line
-                top_key = round(char["top"], 1)
-                if top_key not in char_lines:
-                    char_lines[top_key] = []
-                char_lines[top_key].append(char)
-
-            # Sort by vertical position
-            for top_key in sorted(char_lines.keys()):
-                line_chars = sorted(char_lines[top_key], key=lambda c: c["x0"])
-                if not line_chars:
-                    continue
-
-                line_text = "".join(c.get("text", "") for c in line_chars).strip()
-                if not line_text:
-                    continue
-
-                # Get dominant font size for this line
-                sizes = [c.get("size", 10.0) for c in line_chars if c.get("text", "").strip()]
-                font_size = max(set(sizes), key=sizes.count) if sizes else 10.0
-
-                # Detect bold from font name
-                font_names = [c.get("fontname", "") for c in line_chars if c.get("text", "").strip()]
-                is_bold = any("bold" in fn.lower() or "heavy" in fn.lower() for fn in font_names)
-                is_italic = any("italic" in fn.lower() or "oblique" in fn.lower() for fn in font_names)
-
-                x0 = line_chars[0].get("x0", 0)
-
-                lines.append({
-                    "text": line_text,
-                    "font_size": round(font_size, 1),
-                    "is_bold": is_bold,
-                    "is_italic": is_italic,
-                    "x0": round(x0, 1),
-                    "page": page_num,
-                })
-
-    return lines
-
-
-# ---------------------------------------------------------------------------
-# Line classification for resume structure
-# ---------------------------------------------------------------------------
-BULLET_CHARS = "•\u2022\u2013\u2014\u25aa\u25ba\u25cb\u25e6\u2023\u2043\u00b7"
-SECTION_HEADERS = {
-    "education", "experience", "work experience", "professional experience",
-    "projects", "skills", "technical skills", "certifications", "awards",
-    "achievements", "summary", "objective", "interests", "activities",
-    "volunteer", "publications", "references", "leadership", "coursework",
-    "relevant coursework", "extracurricular", "languages", "honors",
-}
-
-
-def _classify_line(line: dict, max_font_size: float, median_font_size: float) -> str:
-    """Classify a line as name, contact, header, job_title, company_date, bullet, or text."""
-    text = line["text"]
-    size = line["font_size"]
-    is_bold = line["is_bold"]
-
-    # NAME: largest font on the page
-    if size >= max_font_size - 0.5 and size > median_font_size + 2:
-        return "name"
-
-    # CONTACT: has email, phone, or link indicators
-    if ("@" in text or re.search(r"\d{3}[-.\s]?\d{3}[-.\s]?\d{4}", text)
-            or "linkedin" in text.lower() or "github" in text.lower()
-            or "|" in text and len(text.split("|")) >= 2):
-        if size <= median_font_size + 1:
-            return "contact"
-
-    # SECTION HEADER: all caps, or matches known headers, or bold + larger font
-    text_lower = text.lower().strip().rstrip(":")
-    if text_lower in SECTION_HEADERS:
-        return "header"
-    if text.isupper() and len(text) < 40 and len(text) > 1:
-        return "header"
-    if is_bold and size > median_font_size + 0.5 and len(text) < 50:
-        return "header"
-
-    # BULLET: starts with bullet character or dash
-    stripped = text.lstrip()
-    if stripped and stripped[0] in BULLET_CHARS + "-*":
-        return "bullet"
-
-    # JOB TITLE: bold, medium length, not too small
-    if is_bold and not text.isupper() and len(text) < 80:
-        return "job_title"
-
-    # COMPANY/DATE: contains date patterns or italic
-    if re.search(r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|present|\d{4})", text.lower()):
-        if line.get("is_italic") or not is_bold:
-            return "company_date"
-
-    return "text"
-
-
-# ---------------------------------------------------------------------------
-# DOCX builder that mirrors PDF structure
-# ---------------------------------------------------------------------------
-def _add_bottom_border(paragraph):
-    """Add a thin bottom border line under a paragraph (like HR under section headers)."""
-    pPr = paragraph._p.get_or_add_pPr()
-    pBdr = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), "4")  # thin line
-    bottom.set(qn("w:space"), "1")
-    bottom.set(qn("w:color"), "000000")
-    pBdr.append(bottom)
-    pPr.append(pBdr)
-
-
-def _set_paragraph_spacing(paragraph, before_pt=0, after_pt=0, line_spacing_pt=None):
-    """Set exact paragraph spacing."""
-    pPr = paragraph._p.get_or_add_pPr()
-    spacing = OxmlElement("w:spacing")
-    spacing.set(qn("w:before"), str(int(before_pt * 20)))  # twips
-    spacing.set(qn("w:after"), str(int(after_pt * 20)))
-    if line_spacing_pt is not None:
-        spacing.set(qn("w:line"), str(int(line_spacing_pt * 20)))
-        spacing.set(qn("w:lineRule"), "exact")
-    pPr.append(spacing)
-
-
-def _build_resume_docx(structured_lines: list[dict], changes: list[dict]) -> Document:
-    """
-    Build a DOCX document that mirrors the PDF structure.
-    Applies AI-suggested bullet replacements during rebuild.
-    """
-    # Build a replacement map
-    replacements = {}
-    for change in changes:
-        orig = change.get("original", "").strip()
-        repl = change.get("replacement", "").strip()
-        if orig and repl:
-            replacements[orig] = repl
-
-    doc = Document()
-
-    # Page margins matching standard resume
-    section = doc.sections[0]
-    section.top_margin = Inches(0.75)
-    section.bottom_margin = Inches(0.75)
-    section.left_margin = Inches(0.75)
-    section.right_margin = Inches(0.75)
-
-    # Set default font
-    style = doc.styles["Normal"]
-    font = style.font
-    font.name = "Calibri"
-    font.size = Pt(10)
-
-    # Calculate font size stats for classification
-    all_sizes = [l["font_size"] for l in structured_lines]
-    if not all_sizes:
-        return doc
-    max_font_size = max(all_sizes)
-    sorted_sizes = sorted(all_sizes)
-    median_font_size = sorted_sizes[len(sorted_sizes) // 2]
-
-    for line in structured_lines:
-        line_type = _classify_line(line, max_font_size, median_font_size)
-        text = line["text"]
-
-        if line_type == "name":
-            para = doc.add_paragraph()
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = para.add_run(text)
-            run.bold = True
-            run.font.size = Pt(16)
-            run.font.name = "Calibri"
-            run.font.color.rgb = RGBColor(0, 0, 0)
-            _set_paragraph_spacing(para, before_pt=0, after_pt=2)
-
-        elif line_type == "contact":
-            para = doc.add_paragraph()
-            para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            run = para.add_run(text)
-            run.font.size = Pt(10)
-            run.font.name = "Calibri"
-            run.font.color.rgb = RGBColor(51, 51, 51)
-            _set_paragraph_spacing(para, before_pt=0, after_pt=1)
-
-        elif line_type == "header":
-            para = doc.add_paragraph()
-            para.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            run = para.add_run(text.upper())
-            run.bold = True
-            run.font.size = Pt(11)
-            run.font.name = "Calibri"
-            run.font.color.rgb = RGBColor(0, 0, 0)
-            _set_paragraph_spacing(para, before_pt=10, after_pt=2)
-            _add_bottom_border(para)
-
-        elif line_type == "job_title":
-            para = doc.add_paragraph()
-            run = para.add_run(text)
-            run.bold = True
-            run.font.size = Pt(10.5)
-            run.font.name = "Calibri"
-            _set_paragraph_spacing(para, before_pt=6, after_pt=0)
-
-        elif line_type == "company_date":
-            para = doc.add_paragraph()
-            run = para.add_run(text)
-            run.italic = True
-            run.font.size = Pt(10)
-            run.font.name = "Calibri"
-            run.font.color.rgb = RGBColor(68, 68, 68)
-            _set_paragraph_spacing(para, before_pt=0, after_pt=1)
-
-        elif line_type == "bullet":
-            # Strip existing bullet char
-            clean_text = text.lstrip(BULLET_CHARS + "-* \t")
-
-            # Check if this bullet should be replaced
-            final_text = clean_text
-            for orig_text, repl_text in replacements.items():
-                # Try matching with and without bullet chars
-                orig_clean = orig_text.lstrip(BULLET_CHARS + "-* \t")
-                if orig_clean in clean_text or clean_text in orig_clean:
-                    final_text = repl_text.lstrip(BULLET_CHARS + "-* \t")
-                    break
-
-            para = doc.add_paragraph()
-            # Add bullet character with hanging indent
-            run_bullet = para.add_run("•  ")
-            run_bullet.font.size = Pt(10)
-            run_bullet.font.name = "Calibri"
-            run_text = para.add_run(final_text)
-            run_text.font.size = Pt(10)
-            run_text.font.name = "Calibri"
-
-            # Set hanging indent (bullet hangs, text aligns)
-            pPr = para._p.get_or_add_pPr()
-            ind = OxmlElement("w:ind")
-            ind.set(qn("w:left"), "360")    # overall indent
-            ind.set(qn("w:hanging"), "180")  # bullet hangs
-            pPr.append(ind)
-
-            _set_paragraph_spacing(para, before_pt=1, after_pt=1)
-
-        else:
-            # Regular text
-            para = doc.add_paragraph()
-            run = para.add_run(text)
-            run.font.size = Pt(10)
-            run.font.name = "Calibri"
-            _set_paragraph_spacing(para, before_pt=1, after_pt=1)
-
-    return doc
-
-
-# ---------------------------------------------------------------------------
-# DOCX to PDF conversion
-# ---------------------------------------------------------------------------
-def _convert_docx_to_pdf(docx_bytes: bytes) -> Optional[bytes]:
-    """
-    Convert DOCX to PDF using available tools.
-    Tries: docx2pdf (MS Word), LibreOffice, or returns None.
-    """
-    with tempfile.TemporaryDirectory() as tmp_dir:
-        docx_path = Path(tmp_dir) / "resume.docx"
-        pdf_path = Path(tmp_dir) / "resume.pdf"
-
-        docx_path.write_bytes(docx_bytes)
-
-        # Try docx2pdf (uses MS Word on Windows)
-        try:
-            from docx2pdf import convert
-            convert(str(docx_path), str(pdf_path))
-            if pdf_path.exists():
-                return pdf_path.read_bytes()
-        except Exception as e:
-            logger.warning(f"docx2pdf failed: {e}")
-
-        # Try LibreOffice headless
-        for cmd in ["libreoffice", "soffice", r"C:\Program Files\LibreOffice\program\soffice.exe"]:
-            try:
-                result = subprocess.run(
-                    [cmd, "--headless", "--convert-to", "pdf", "--outdir", tmp_dir, str(docx_path)],
-                    capture_output=True, timeout=30,
-                )
-                if pdf_path.exists():
-                    return pdf_path.read_bytes()
-            except (FileNotFoundError, subprocess.TimeoutExpired):
-                continue
-
-    return None
-
-
-# ---------------------------------------------------------------------------
 # Keyword extraction & ATS scoring
 # ---------------------------------------------------------------------------
 STOP_WORDS = {
@@ -419,7 +92,6 @@ STOP_WORDS = {
     "into", "over", "after", "before", "between", "under", "above",
     "up", "down", "out", "off", "through", "during", "including",
     "the", "etc", "eg", "ie", "via", "per", "re", "vs",
-    # Job posting filler
     "role", "position", "team", "company", "work", "working",
     "experience", "years", "ability", "strong", "skills",
     "required", "preferred", "responsibilities", "qualifications",
@@ -487,31 +159,23 @@ async def analyze_resume(
     Analyze a resume against a job description.
     Returns AI-suggested changes and ATS score before/after.
     """
-    # 1. Extract text from PDF
     file_bytes = await resume.read()
     resume_text = _extract_pdf_text(file_bytes)
     if not resume_text.strip():
         return {"error": "Could not extract text from the uploaded PDF."}
 
-    # 2. Extract keywords from job description
     keywords = _extract_keywords(job_description, top_n=20)
-
-    # 3. Calculate ATS score BEFORE
     ats_before, matched_before, missing_before = _calculate_ats_score(resume_text, keywords)
 
-    # 4. Send to Groq (Llama 3.3 70B — free)
     try:
         raw = await _call_llm(
             SYSTEM_PROMPT,
             f"RESUME:\n{resume_text}\n\n---\n\nJOB DESCRIPTION:\n{job_description}",
         )
-
-        # Strip markdown code fences if present
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?\s*", "", cleaned)
             cleaned = re.sub(r"\s*```$", "", cleaned)
-
         changes = json.loads(cleaned)
     except json.JSONDecodeError:
         logger.error(f"Groq returned invalid JSON: {raw[:500]}")
@@ -520,7 +184,6 @@ async def analyze_resume(
         logger.error(f"Groq API error: {exc}")
         return {"error": f"AI processing failed: {str(exc)}"}
 
-    # 5. Calculate ATS score AFTER (simulate applying changes)
     modified_text = resume_text
     for change in changes:
         original = change.get("original", "")
@@ -540,61 +203,261 @@ async def analyze_resume(
 
 
 # ---------------------------------------------------------------------------
-# ENDPOINT 2: Download tailored resume (PDF or DOCX)
-# Extracts PDF structure → rebuilds as DOCX → converts to PDF
+# PDF-to-PDF tailoring engine (custom PyMuPDF approach)
+# ---------------------------------------------------------------------------
+
+# Map common PDF font names to fitz built-in fonts
+FONT_MAP = {
+    "times": "tiro", "timesnewroman": "tiro", "timesnewromanps": "tiro",
+    "times-roman": "tiro", "tiro": "tiro", "cambria": "tiro",
+    "garamond": "tiro", "georgia": "tiro", "palatino": "tiro",
+    "bookantiqua": "tiro", "baskerville": "tiro",
+    "helvetica": "helv", "arial": "helv", "arialmt": "helv",
+    "helv": "helv", "calibri": "helv", "verdana": "helv",
+    "tahoma": "helv", "segoeui": "helv", "roboto": "helv",
+    "inter": "helv", "lato": "helv", "opensans": "helv",
+    "montserrat": "helv", "poppins": "helv",
+    "courier": "cour", "couriernew": "cour", "cour": "cour",
+}
+
+SERIF_HINTS = {"times", "roman", "serif", "garamond", "georgia", "cambria",
+               "palatino", "book", "antiqua", "tiro", "caslon", "baskerville"}
+
+
+def _map_font(pdf_font_name: str) -> str:
+    """Map a PDF font name to closest fitz built-in font."""
+    clean = re.sub(r"[\s\-_,]+", "", pdf_font_name.lower())
+    clean = re.sub(r"(bold|italic|oblique|regular|medium|light|condensed|"
+                   r"semibold|extrabold|thin|black|mt|ps|it|bi|bo)", "", clean).strip()
+
+    if clean in FONT_MAP:
+        return FONT_MAP[clean]
+    for hint in SERIF_HINTS:
+        if hint in clean:
+            logger.info(f"Font '{pdf_font_name}' → tiro (serif match)")
+            return "tiro"
+    logger.info(f"Font '{pdf_font_name}' → helv (sans-serif fallback)")
+    return "helv"
+
+
+def _int_to_rgb(color_int: int) -> tuple:
+    """Convert integer color to (r, g, b) tuple in 0-1 range."""
+    r = ((color_int >> 16) & 0xFF) / 255.0
+    g = ((color_int >> 8) & 0xFF) / 255.0
+    b = (color_int & 0xFF) / 255.0
+    return (r, g, b)
+
+
+def _get_font_suffix(flags: int) -> str:
+    """Get bold/italic suffix from span flags."""
+    is_bold = bool(flags & (1 << 4))
+    is_italic = bool(flags & (1 << 1))
+    if is_bold and is_italic:
+        return "bi"
+    elif is_bold:
+        return "bo"
+    elif is_italic:
+        return "it"
+    return ""
+
+
+def _build_span_index(page) -> list[dict]:
+    """Extract all text spans from a page with their full properties."""
+    spans = []
+    blocks = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)["blocks"]
+    for block in blocks:
+        if block.get("type") != 0:  # text blocks only
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                text = span.get("text", "")
+                if not text.strip():
+                    continue
+                spans.append({
+                    "text": text,
+                    "bbox": span["bbox"],  # (x0, y0, x1, y1)
+                    "font": span.get("font", "Helvetica"),
+                    "size": span.get("size", 10.0),
+                    "color": span.get("color", 0),
+                    "flags": span.get("flags", 0),
+                    "origin": span.get("origin", (span["bbox"][0], span["bbox"][3])),
+                })
+    return spans
+
+
+def _find_spans_for_text(spans: list[dict], search_text: str) -> list[dict]:
+    """
+    Find the sequence of consecutive spans whose combined text
+    contains the search_text. Returns the matched spans.
+    """
+    search_clean = search_text.strip()
+    if not search_clean:
+        return []
+
+    # Try to find a window of spans whose concatenated text contains search_text
+    for i in range(len(spans)):
+        concat = ""
+        window = []
+        for j in range(i, min(i + 15, len(spans))):
+            concat += spans[j]["text"]
+            window.append(spans[j])
+
+            # Normalize whitespace for comparison
+            concat_norm = re.sub(r"\s+", " ", concat.strip())
+            search_norm = re.sub(r"\s+", " ", search_clean)
+
+            if search_norm[:50] in concat_norm or concat_norm in search_norm:
+                # Verify enough overlap
+                if len(concat_norm) >= min(len(search_norm), 20):
+                    return window
+
+    return []
+
+
+def _compute_bounding_rect(spans: list[dict]) -> fitz.Rect:
+    """Compute the bounding rectangle of a list of spans."""
+    x0 = min(s["bbox"][0] for s in spans)
+    y0 = min(s["bbox"][1] for s in spans)
+    x1 = max(s["bbox"][2] for s in spans)
+    y1 = max(s["bbox"][3] for s in spans)
+    return fitz.Rect(x0, y0, x1, y1)
+
+
+def tailor_pdf(pdf_bytes: bytes, changes: list[dict]) -> bytes:
+    """
+    Core PDF tailoring function.
+    Opens the original PDF, finds each original text, whites it out,
+    and inserts the replacement text at the exact same position
+    using insert_textbox for proper wrapping.
+    """
+    doc = fitz.open(stream=pdf_bytes, filetype="pdf")
+
+    for page in doc:
+        # Build full span index for this page
+        all_spans = _build_span_index(page)
+
+        for change in changes:
+            original = change.get("original", "").strip()
+            replacement = change.get("replacement", "").strip()
+            if not original or not replacement:
+                continue
+
+            # Find spans matching original text
+            matched = _find_spans_for_text(all_spans, original)
+
+            if not matched:
+                # Try with shorter text
+                matched = _find_spans_for_text(all_spans, original[:40])
+
+            if not matched:
+                logger.warning(f"Could not find text in PDF: '{original[:50]}...'")
+                continue
+
+            # Extract font properties from first matched span
+            ref = matched[0]
+            font_name_raw = ref["font"]
+            font_size = ref["size"]
+            color_int = ref["color"]
+            flags = ref["flags"]
+
+            font_base = _map_font(font_name_raw)
+            suffix = _get_font_suffix(flags)
+            font_name = font_base + suffix if suffix else font_base
+
+            color = _int_to_rgb(color_int) if isinstance(color_int, int) else (0, 0, 0)
+
+            # Compute bounding rect of all matched spans
+            bounds = _compute_bounding_rect(matched)
+
+            # Extend to right margin (bullets often span full width)
+            right_margin = page.rect.width - bounds.x0
+            text_rect = fitz.Rect(
+                bounds.x0,
+                bounds.y0,
+                min(bounds.x0 + right_margin, page.rect.width - 30),
+                bounds.y1,
+            )
+
+            # --- White out all matched span areas ---
+            for span in matched:
+                bbox = span["bbox"]
+                whiteout = fitz.Rect(
+                    bbox[0] - 0.5,
+                    bbox[1] - 0.5,
+                    page.rect.width - 30,  # extend to right margin
+                    bbox[3] + 0.5,
+                )
+                page.draw_rect(whiteout, color=(1, 1, 1), fill=(1, 1, 1))
+
+            # --- Insert replacement text ---
+            # Use insert_textbox for automatic word wrapping within bounds
+            adjusted_size = font_size
+
+            # Try fitting text, reduce size if needed (max -1pt)
+            for attempt in range(3):
+                rc = page.insert_textbox(
+                    text_rect,
+                    replacement,
+                    fontname=font_name,
+                    fontsize=adjusted_size,
+                    color=color,
+                    align=fitz.TEXT_ALIGN_LEFT,
+                )
+                if rc >= 0:
+                    # Text fit successfully
+                    break
+                else:
+                    # rc < 0 means text didn't fit, reduce size
+                    adjusted_size -= 0.5
+                    # White out again (previous attempt left partial text)
+                    for span in matched:
+                        bbox = span["bbox"]
+                        page.draw_rect(
+                            fitz.Rect(bbox[0] - 0.5, bbox[1] - 0.5,
+                                      page.rect.width - 30, bbox[3] + 0.5),
+                            color=(1, 1, 1), fill=(1, 1, 1),
+                        )
+
+    result = doc.tobytes()
+    doc.close()
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ENDPOINT 2: Download / Tailor — Custom PDF-to-PDF
 # ---------------------------------------------------------------------------
 @router.post("/download")
+@router.post("/tailor")
 async def download_resume(
     resume: UploadFile = File(...),
     changes: str = Form(...),
 ):
     """
-    Rebuild the resume as a formatted DOCX with AI changes applied,
-    then convert to PDF if possible. Falls back to DOCX download.
+    Custom PDF-to-PDF tailoring. Finds original bullet text in the PDF,
+    whites it out, and inserts replacement text at exact same coordinates
+    with matching font, size, and color. Returns modified PDF.
     """
-    # 1. Read the original PDF
     file_bytes = await resume.read()
 
-    # 2. Parse changes
     try:
         change_list = json.loads(changes)
     except json.JSONDecodeError:
         return {"error": "Invalid changes JSON"}
 
-    # 3. Extract structure from PDF
-    structured_lines = _extract_pdf_structure(file_bytes)
-    if not structured_lines:
-        return {"error": "Could not extract structure from PDF"}
+    try:
+        pdf_bytes = tailor_pdf(file_bytes, change_list)
+    except Exception as exc:
+        logger.error(f"PDF tailoring failed: {exc}", exc_info=True)
+        return {"error": f"PDF tailoring failed: {str(exc)}"}
 
-    # 4. Build DOCX mirroring the PDF with changes applied
-    docx_doc = _build_resume_docx(structured_lines, change_list)
+    buffer = io.BytesIO(pdf_bytes)
+    buffer.seek(0)
 
-    # 5. Save DOCX to buffer
-    docx_buffer = io.BytesIO()
-    docx_doc.save(docx_buffer)
-    docx_bytes = docx_buffer.getvalue()
-
-    # 6. Try converting DOCX to PDF
-    pdf_bytes = _convert_docx_to_pdf(docx_bytes)
-
-    if pdf_bytes:
-        # Return as PDF
-        buffer = io.BytesIO(pdf_bytes)
-        buffer.seek(0)
-        return StreamingResponse(
-            buffer,
-            media_type="application/pdf",
-            headers={"Content-Disposition": "attachment; filename=tailored_resume.pdf"},
-        )
-    else:
-        # Fallback: return DOCX
-        logger.info("PDF conversion not available, returning DOCX")
-        docx_buffer.seek(0)
-        return StreamingResponse(
-            docx_buffer,
-            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            headers={"Content-Disposition": "attachment; filename=tailored_resume.docx"},
-        )
+    return StreamingResponse(
+        buffer,
+        media_type="application/pdf",
+        headers={"Content-Disposition": "attachment; filename=tailored_resume.pdf"},
+    )
 
 
 # ---------------------------------------------------------------------------
